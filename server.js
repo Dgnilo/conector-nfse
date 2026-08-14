@@ -2,6 +2,8 @@
 // Recebe chamadas autenticadas do BI e fala com o web service da Prefeitura.
 import express from "express";
 import https from "node:https";
+import tls from "node:tls";
+import dns from "node:dns/promises";
 import crypto from "node:crypto";
 import forge from "node-forge";
 import { SignedXml } from "xml-crypto";
@@ -56,6 +58,117 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/diagnostico", (_req, res) =>
   res.json({ ok: true, autenticado: true, servico: "conector-nfse", versao: 1 }),
 );
+
+// Diagnostico de rede/TLS com a Prefeitura. NAO emite NFS-e, NAO consome RPS,
+// NAO envia SOAP. Apenas DNS + TLS + leitura do WSDL.
+app.get("/diagnostico-prefeitura", async (req, res) => {
+  const ambiente = req.query.ambiente === "producao" ? "producao" : "producao";
+  const host = new URL(ENDPOINTS[ambiente]).hostname;
+  const out = {
+    ambiente,
+    host,
+    dns: { status: "ERRO", detalhe: null },
+    render_prefeitura: "ERRO",
+    tls: { status: "ERRO", protocolo: null, cifra: null, detalhe: null },
+    certificado_remoto: null,
+    mtls: { status: "nao testado", detalhe: "Handshake mTLS so ocorre no envio real; nao executado para nao consumir RPS." },
+    wsdl: { status: "ERRO", http_status: null, content_type: null, bytes: null, detalhe: null },
+    soap: "nao testado",
+  };
+
+  try {
+    const enderecos = await dns.lookup(host, { all: true });
+    out.dns = { status: "OK", detalhe: enderecos.map((e) => e.address) };
+  } catch (e) {
+    out.dns.detalhe = e?.message || String(e);
+    return res.json(out);
+  }
+
+  // Handshake TLS simples (sem certificado cliente)
+  await new Promise((resolve) => {
+    const socket = tls.connect({ host, port: 443, servername: host, timeout: 12000 }, () => {
+      const cert = socket.getPeerCertificate(true) || {};
+      out.tls = {
+        status: "OK",
+        protocolo: socket.getProtocol(),
+        cifra: socket.getCipher()?.name || null,
+        detalhe: socket.authorized ? "cadeia validada" : `nao autorizado: ${socket.authorizationError}`,
+      };
+      out.render_prefeitura = "OK";
+      out.certificado_remoto = {
+        subject_cn: cert?.subject?.CN || null,
+        emissor_cn: cert?.issuer?.CN || null,
+        valido_de: cert?.valid_from || null,
+        valido_ate: cert?.valid_to || null,
+        cadeia: (() => {
+          const nomes = [];
+          let c = cert;
+          const vistos = new Set();
+          while (c && c.fingerprint && !vistos.has(c.fingerprint)) {
+            vistos.add(c.fingerprint);
+            nomes.push(c?.subject?.CN || "?");
+            c = c.issuerCertificate;
+          }
+          return nomes;
+        })(),
+      };
+      socket.end();
+      resolve();
+    });
+    socket.on("timeout", () => {
+      out.tls.detalhe = "timeout no handshake TLS";
+      socket.destroy();
+      resolve();
+    });
+    socket.on("error", (e) => {
+      out.tls.detalhe = e?.message || String(e);
+      resolve();
+    });
+  });
+
+  if (out.tls.status !== "OK") return res.json(out);
+
+  // WSDL (GET simples, sem SOAP)
+  await new Promise((resolve) => {
+    const url = new URL(ENDPOINTS[ambiente] + "?wsdl");
+    const r = https.request(
+      { method: "GET", host: url.hostname, path: url.pathname + url.search, port: 443 },
+      (resp) => {
+        const chunks = [];
+        resp.on("data", (c) => chunks.push(c));
+        resp.on("end", () => {
+          const texto = Buffer.concat(chunks).toString("utf8");
+          const temEnvioRps = /EnvioRPS/.test(texto);
+          out.wsdl = {
+            status: resp.statusCode === 200 && temEnvioRps ? "OK" : "ERRO",
+            http_status: resp.statusCode || null,
+            content_type: resp.headers["content-type"] || null,
+            bytes: texto.length,
+            detalhe: temEnvioRps ? "operacao EnvioRPS presente no WSDL" : "EnvioRPS nao encontrado no WSDL",
+          };
+          resolve();
+        });
+      },
+    );
+    r.setTimeout(15000, () => {
+      out.wsdl.detalhe = "timeout ao ler o WSDL";
+      r.destroy();
+      resolve();
+    });
+    r.on("error", (e) => {
+      out.wsdl.detalhe = e?.message || String(e);
+      resolve();
+    });
+    r.end();
+  });
+
+  log("DIAG", "Diagnostico Prefeitura concluido", {
+    dns: out.dns.status,
+    tls: out.tls.status,
+    wsdl: out.wsdl.status,
+  });
+  res.json(out);
+});
 
 
 // ───────────────────────── certificado ─────────────────────────
@@ -127,6 +240,38 @@ function assinaturaRps(p, keyPem) {
   return signer.sign(keyPem, "base64");
 }
 
+/**
+ * EnderecoTomador na sequencia exata do XSD:
+ * TipoLogradouro, Logradouro, NumeroEndereco, ComplementoEndereco?, Bairro, Cidade, UF, CEP.
+ * Sem todos os campos obrigatorios -> omite o bloco inteiro (nunca endereco parcial).
+ */
+function enderecoTomadorXml(t) {
+  if (!t) return "";
+  const tipo = so(t.tipo_logradouro || t.tipoLogradouro).trim();
+  const logradouro = so(t.logradouro || t.endereco).trim();
+  const numero = so(t.numero || t.numero_endereco).trim();
+  const bairro = so(t.bairro).trim();
+  const cidade = digitos(t.cidade_ibge || t.codigo_cidade);
+  const uf = so(t.uf).trim().toUpperCase();
+  const cep = digitos(t.cep);
+  if (!tipo || !logradouro || !numero || !bairro || cidade.length !== 7 || uf.length !== 2 || cep.length !== 8) {
+    return "";
+  }
+  const complemento = so(t.complemento).trim();
+  return (
+    `<EnderecoTomador>` +
+    `<TipoLogradouro>${xmlEsc(tipo)}</TipoLogradouro>` +
+    `<Logradouro>${xmlEsc(logradouro)}</Logradouro>` +
+    `<NumeroEndereco>${xmlEsc(numero)}</NumeroEndereco>` +
+    (complemento ? `<ComplementoEndereco>${xmlEsc(complemento)}</ComplementoEndereco>` : "") +
+    `<Bairro>${xmlEsc(bairro)}</Bairro>` +
+    `<Cidade>${cidade}</Cidade>` +
+    `<UF>${uf}</UF>` +
+    `<CEP>${cep}</CEP>` +
+    `</EnderecoTomador>`
+  );
+}
+
 function xmlEnvioRps(p, keyPem) {
   const tomadorCpf = digitos(p.tomador?.cpf);
   const tomadorCnpj = digitos(p.tomador?.cnpj);
@@ -157,7 +302,7 @@ function xmlEnvioRps(p, keyPem) {
 <ISSRetido>${p.servico.iss_retido ? "true" : "false"}</ISSRetido>
 ${tomadorCpfCnpj}
 <RazaoSocialTomador>${xmlEsc(p.tomador?.nome)}</RazaoSocialTomador>
-${p.tomador?.cep ? `<EnderecoTomador><CEP>${digitos(p.tomador.cep)}</CEP><Logradouro>${xmlEsc(p.tomador.endereco)}</Logradouro><Cidade>3550308</Cidade><UF>SP</UF></EnderecoTomador>` : ""}
+${enderecoTomadorXml(p.tomador)}
 ${p.tomador?.email ? `<EmailTomador>${xmlEsc(p.tomador.email)}</EmailTomador>` : ""}
 <Discriminacao>${xmlEsc(p.servico.discriminacao)}</Discriminacao>
 </RPS>
@@ -171,16 +316,33 @@ function assinarXml(xml, keyPem, certPem) {
     signatureAlgorithm: "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
     canonicalizationAlgorithm: "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
   });
+  // Enveloped sobre o documento inteiro: URI="" e SEM atributo Id na raiz.
   sig.addReference({
     xpath: "/*",
+    uri: "",
+    isEmptyUri: true,
     digestAlgorithm: "http://www.w3.org/2000/09/xmldsig#sha1",
     transforms: [
       "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
       "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
     ],
   });
+  // Assinatura como ultimo filho de PedidoEnvioRPS.
   sig.computeSignature(xml, { location: { reference: "/*", action: "append" } });
-  return sig.getSignedXml();
+  const assinado = sig.getSignedXml();
+
+  // Diagnostico seguro: nenhum valor sensivel, apenas hashes e flags.
+  const semAssinatura = assinado.replace(/<(\w+:)?Signature[\s\S]*?<\/(\w+:)?Signature>/i, "");
+  log("06", "Diagnostico da assinatura", {
+    hash_xml_base_sha256: crypto.createHash("sha256").update(xml, "utf8").digest("hex").slice(0, 16),
+    hash_xml_assinado_sha256: crypto.createHash("sha256").update(assinado, "utf8").digest("hex").slice(0, 16),
+    hash_sem_assinatura_sha256: crypto.createHash("sha256").update(semAssinatura, "utf8").digest("hex").slice(0, 16),
+    uri_referencia_vazia: /URI=""/.test(assinado),
+    id_na_raiz: /<PedidoEnvioRPS[^>]*\sId=/i.test(assinado),
+    assinatura_ultimo_filho: /<\/(\w+:)?Signature>\s*<\/PedidoEnvioRPS>/i.test(assinado),
+    bytes: assinado.length,
+  });
+  return assinado;
 }
 
 // ───────────────────────── SOAP ─────────────────────────
