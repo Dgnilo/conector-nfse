@@ -15,15 +15,39 @@ const ENDPOINTS = {
   homologacao: "https://nfeh.prefeitura.sp.gov.br/ws/lotenfe.asmx",
 };
 
+// ───────────────────── logs de diagnostico (sem segredos) ─────────────────────
+// NUNCA logar: senha do certificado, conteudo do PFX, chave privada,
+// CONECTOR_TOKEN ou token do emissor.
+const ts = () => new Date().toISOString();
+const log = (etapa, msg, extra) =>
+  console.log(
+    `[NFSE-SP] ${etapa} - ${msg}${extra ? " " + JSON.stringify(extra) : ""} @ ${ts()}`,
+  );
+const logErro = (etapa, msg, extra) =>
+  console.error(
+    `[NFSE-SP][ERRO][ETAPA ${etapa}] ${msg}${extra ? " " + JSON.stringify(extra) : ""} @ ${ts()}`,
+  );
+const sanitiza = (texto, max = 2000) =>
+  String(texto || "")
+    .replace(/<[^>]*(Assinatura|X509Certificate|SignatureValue|DigestValue)[^>]*>[\s\S]*?<\/[^>]*>/gi, "<...omitido...>")
+    .replace(/\s+/g, " ")
+    .slice(0, max);
+
 const app = express();
 app.use(express.json({ limit: "12mb" }));
 
 app.use((req, res, next) => {
   if (req.path === "/health") return next();
+  log("01", "Requisicao recebida", { rota: req.path, metodo: req.method });
   const got = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (!TOKEN || got !== TOKEN) return res.status(401).json({ erro: "Token invalido" });
+  if (!TOKEN || got !== TOKEN) {
+    logErro("02", "Token invalido ou ausente", { rota: req.path });
+    return res.status(401).json({ erro: "Token invalido" });
+  }
+  log("02", "Token validado");
   next();
 });
+
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
@@ -184,19 +208,41 @@ function chamarPrefeitura({ ambiente, operacao, xmlPedido, pfxBuffer, senha }) {
       SOAPAction: `http://www.prefeitura.sp.gov.br/nfe/${operacao}`,
     },
   };
+  const endpoint = url.toString();
+  log("07", "Enviando para Prefeitura", { endpoint, operacao, bytes_envio: body.length });
   return new Promise((resolve, reject) => {
     const req = https.request(options, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
-      res.on("end", () =>
-        resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks).toString("utf8") }),
-      );
+      res.on("end", () => {
+        const texto = Buffer.concat(chunks).toString("utf8");
+        log("08", `Prefeitura respondeu HTTP ${res.statusCode || 0}`, {
+          endpoint,
+          content_type: res.headers["content-type"] || null,
+          bytes_resposta: texto.length,
+        });
+        resolve({
+          status: res.statusCode || 0,
+          body: texto,
+          contentType: res.headers["content-type"] || null,
+          endpoint,
+        });
+      });
     });
-    req.on("error", reject);
+    req.on("error", (e) => {
+      logErro("07", "Falha de conexao/TLS com a Prefeitura", {
+        endpoint,
+        erro: e?.message || String(e),
+        code: e?.code || null,
+      });
+      e.endpoint = endpoint;
+      reject(e);
+    });
     req.write(body);
     req.end();
   });
 }
+
 
 const parser = new XMLParser({ ignoreAttributes: false, removeNSPrefix: true, parseTagValue: false });
 
@@ -217,24 +263,74 @@ function interpretarRetorno(xml) {
 // ───────────────────────── rotas ─────────────────────────
 
 app.post("/nfse/emitir", async (req, res) => {
+  let etapa = "03";
+  const p = req.body || {};
+  const ambiente = p.ambiente === "producao" ? "producao" : "homologacao";
+  const endpointPrevisto = ENDPOINTS[ambiente];
+  const contexto = {
+    rota: "/nfse/emitir",
+    cnpj_prestador: zeros(p.prestador?.cnpj, 14),
+    inscricao_municipal: zeros(p.prestador?.inscricao_municipal, 8),
+    rps_numero: digitos(p.rps?.numero),
+    rps_serie: so(p.rps?.serie || "RPS"),
+    ambiente,
+    endpoint: endpointPrevisto,
+  };
   try {
-    const p = req.body || {};
+    log("03", "PFX recebido", {
+      ...contexto,
+      pfx_bytes_base64: so(p.certificado?.pfx_base64).length,
+      senha_informada: Boolean(p.certificado?.senha),
+    });
+
     const { keyPem, certPem, pfxBuffer } = lerCertificado(
       p.certificado?.pfx_base64,
       p.certificado?.senha,
     );
-    const xml = assinarXml(xmlEnvioRps(p, keyPem), keyPem, certPem);
+    log("04", "PFX aberto com sucesso", { chave_privada: Boolean(keyPem), certificado: Boolean(certPem) });
+
+    etapa = "05";
+    const xmlPedido = xmlEnvioRps(p, keyPem);
+    log("05", "XML montado", { bytes: xmlPedido.length });
+
+    etapa = "06";
+    const xml = assinarXml(xmlPedido, keyPem, certPem);
+    log("06", "XML assinado", { bytes: xml.length });
+
+    etapa = "07";
     const r = await chamarPrefeitura({
-      ambiente: p.ambiente,
+      ambiente,
       operacao: "EnvioRPS",
       xmlPedido: xml,
       pfxBuffer,
       senha: p.certificado.senha,
     });
+
+    etapa = "08";
     const info = interpretarRetorno(r.body);
     if (r.status !== 200 || !info.sucesso) {
-      return res.status(422).json({ erro: info.erro || `HTTP ${r.status}`, xml_retorno: r.body.slice(0, 4000) });
+      logErro("08", "Prefeitura retornou erro", {
+        ...contexto,
+        http_status: r.status,
+        content_type: r.contentType,
+        bytes: r.body.length,
+        mensagem: info.erro || null,
+        trecho: sanitiza(r.body, 600),
+      });
+      return res.status(422).json({
+        etapa: "08 - resposta da Prefeitura",
+        erro: info.erro || `HTTP ${r.status}`,
+        http_status: r.status,
+        content_type: r.contentType,
+        endpoint: r.endpoint,
+        ambiente,
+        rps_numero: contexto.rps_numero,
+        rps_serie: contexto.rps_serie,
+        resposta_trecho: sanitiza(r.body, 2000),
+        xml_retorno: r.body.slice(0, 4000),
+      });
     }
+    log("09", "NFS-e emitida", { ...contexto, numero_nfse: info.numero });
     res.json({
       numero_nfse: info.numero,
       codigo_verificacao: info.codigo,
@@ -244,9 +340,27 @@ app.post("/nfse/emitir", async (req, res) => {
       xml_retorno: r.body.slice(0, 8000),
     });
   } catch (e) {
-    res.status(500).json({ erro: e?.message || String(e) });
+    const nomeEtapa =
+      { "03": "leitura/abertura do PFX", "05": "montagem do XML", "06": "assinatura do XML", "07": "conexao com a Prefeitura", "08": "interpretacao do retorno" }[etapa] ||
+      "desconhecida";
+    logErro(etapa, `Falha na etapa ${nomeEtapa}`, {
+      ...contexto,
+      erro: e?.message || String(e),
+      code: e?.code || null,
+      stack: sanitiza(e?.stack, 800),
+    });
+    res.status(500).json({
+      etapa: `${etapa} - ${nomeEtapa}`,
+      erro: e?.message || String(e),
+      code: e?.code || null,
+      endpoint: endpointPrevisto,
+      ambiente,
+      rps_numero: contexto.rps_numero,
+      rps_serie: contexto.rps_serie,
+    });
   }
 });
+
 
 app.post("/nfse/consultar", async (req, res) => {
   try {
