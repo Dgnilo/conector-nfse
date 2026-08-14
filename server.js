@@ -445,10 +445,23 @@ function postarSoap({ url, body, pfxBuffer, senha, headers, endpoint, versao }) 
 async function chamarPrefeitura({ ambiente, operacao, xmlPedido, pfxBuffer, senha }) {
   const url = new URL(ENDPOINTS[ambiente === "producao" ? "producao" : "homologacao"]);
   const endpoint = url.toString();
-  const acao = `http://www.prefeitura.sp.gov.br/nfe/${operacao}`;
+  const acoesSoap = {
+    EnvioRPS: "http://www.prefeitura.sp.gov.br/nfe/EnvioRPS",
+    TesteEnvioLoteRPS: "http://www.prefeitura.sp.gov.br/nfe/TesteEnvioLoteRPS",
+    ConsultaNFe: "http://www.prefeitura.sp.gov.br/nfe/ConsultaNFe",
+    CancelamentoNFe: "http://www.prefeitura.sp.gov.br/nfe/CancelamentoNFe",
+  };
+  const acao = acoesSoap[operacao];
+  if (!acao) throw new Error(`Operacao SOAP nao permitida: ${operacao}`);
 
   const body11 = Buffer.from(soapEnvelope(operacao, xmlPedido, 11), "utf8");
-  log("07", "Enviando para Prefeitura", { endpoint, operacao, soap: "1.1", bytes_envio: body11.length });
+  log("07", "Enviando para Prefeitura", {
+    endpoint,
+    operacao,
+    soap: "1.1",
+    soap_action: acao,
+    bytes_envio: body11.length,
+  });
   let r = await postarSoap({
     url,
     body: body11,
@@ -467,7 +480,9 @@ async function chamarPrefeitura({ ambiente, operacao, xmlPedido, pfxBuffer, senh
     },
   });
 
-  // Fallback: alguns servidores da Prefeitura so aceitam SOAP 1.2 (500 com HTML generico no 1.1).
+  // O ASMX oficial publica SOAP 1.1. SOAP 1.2 fica apenas como fallback de
+  // transporte; se ambos devolverem HTML, preserve a resposta do segundo para
+  // que o log mostre que o fallback tambem foi executado.
   const htmlErro = r.status >= 500 && /html/i.test(r.contentType || "");
   if (htmlErro) {
     const body12 = Buffer.from(soapEnvelope(operacao, xmlPedido, 12), "utf8");
@@ -487,7 +502,7 @@ async function chamarPrefeitura({ ambiente, operacao, xmlPedido, pfxBuffer, senh
         Connection: "close",
       },
     });
-    if (r12.status < 500 || !/html/i.test(r12.contentType || "")) r = r12;
+    r = r12;
   }
   return r;
 }
@@ -541,7 +556,11 @@ app.post("/nfse/emitir", async (req, res) => {
 
     etapa = "05";
     const xmlPedido = xmlEnvioRps(p, keyPem);
-    log("05", "XML montado", { bytes: xmlPedido.length });
+    log("05", "XML montado", {
+      bytes: xmlPedido.length,
+      namespace_raiz: /<PedidoEnvioRPS\s[^>]*xmlns="http:\/\/www\.prefeitura\.sp\.gov\.br\/nfe"/.test(xmlPedido),
+      namespace_zerado_em_filhos: /<(Cabecalho|RPS)\b[^>]*xmlns=""/.test(xmlPedido),
+    });
 
     etapa = "06";
     const xml = assinarXml(xmlPedido, keyPem, certPem);
