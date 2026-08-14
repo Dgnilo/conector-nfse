@@ -272,11 +272,11 @@ function enderecoTomadorXml(t) {
   );
 }
 
-function xmlEnvioRps(p, keyPem) {
+/** Bloco <RPS> (namespace vazio) usado tanto no EnvioRPS quanto no TesteEnvioLoteRPS. */
+function rpsXml(p, keyPem) {
   const tomadorCpf = digitos(p.tomador?.cpf);
   const tomadorCnpj = digitos(p.tomador?.cnpj);
   const data = so(p.rps.data_emissao).slice(0, 10);
-  const cnpjPrestador = zeros(p.prestador.cnpj, 14);
   const aliquota = (Number(p.prestador.aliquota_iss || 0) / 100).toFixed(4);
 
   const tomadorCpfCnpj = tomadorCnpj
@@ -285,10 +285,7 @@ function xmlEnvioRps(p, keyPem) {
       ? `<CPFCNPJTomador><CPF>${tomadorCpf}</CPF></CPFCNPJTomador>`
       : "";
 
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<PedidoEnvioRPS xmlns="http://www.prefeitura.sp.gov.br/nfe" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-<Cabecalho xmlns="" Versao="1"><CPFCNPJRemetente><CNPJ>${cnpjPrestador}</CNPJ></CPFCNPJRemetente></Cabecalho>
-<RPS xmlns="">
+  return `<RPS xmlns="">
 <Assinatura>${assinaturaRps(p, keyPem)}</Assinatura>
 <ChaveRPS><InscricaoPrestador>${zeros(p.prestador.inscricao_municipal, 8)}</InscricaoPrestador><SerieRPS>${xmlEsc(p.rps.serie || "RPS")}</SerieRPS><NumeroRPS>${digitos(p.rps.numero)}</NumeroRPS></ChaveRPS>
 <TipoRPS>RPS</TipoRPS>
@@ -305,9 +302,42 @@ ${tomadorCpfCnpj}
 ${enderecoTomadorXml(p.tomador)}
 ${p.tomador?.email ? `<EmailTomador>${xmlEsc(p.tomador.email)}</EmailTomador>` : ""}
 <Discriminacao>${xmlEsc(p.servico.discriminacao)}</Discriminacao>
-</RPS>
+</RPS>`;
+}
+
+function xmlEnvioRps(p, keyPem) {
+  const cnpjPrestador = zeros(p.prestador.cnpj, 14);
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<PedidoEnvioRPS xmlns="http://www.prefeitura.sp.gov.br/nfe" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+<Cabecalho xmlns="" Versao="1"><CPFCNPJRemetente><CNPJ>${cnpjPrestador}</CNPJ></CPFCNPJRemetente></Cabecalho>
+${rpsXml(p, keyPem)}
 </PedidoEnvioRPS>`;
 }
+
+/**
+ * PedidoEnvioLoteRPS usado APENAS na operacao oficial de TESTE (TesteEnvioLoteRPS).
+ * A Prefeitura valida schema, assinatura e regras sem gerar NFS-e.
+ */
+function xmlTesteEnvioLoteRps(p, keyPem) {
+  const cnpjPrestador = zeros(p.prestador.cnpj, 14);
+  const data = so(p.rps.data_emissao).slice(0, 10);
+  const valor = Number(p.servico.valor || 0).toFixed(2);
+  const deducoes = Number(p.servico.deducoes || 0).toFixed(2);
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<PedidoEnvioLoteRPS xmlns="http://www.prefeitura.sp.gov.br/nfe" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+<Cabecalho xmlns="" Versao="1">
+<CPFCNPJRemetente><CNPJ>${cnpjPrestador}</CNPJ></CPFCNPJRemetente>
+<transacao>true</transacao>
+<dtInicio>${data}</dtInicio>
+<dtFim>${data}</dtFim>
+<QtdRPS>1</QtdRPS>
+<ValorTotalServicos>${valor}</ValorTotalServicos>
+<ValorTotalDeducoes>${deducoes}</ValorTotalDeducoes>
+</Cabecalho>
+${rpsXml(p, keyPem)}
+</PedidoEnvioLoteRPS>`;
+}
+
 
 function assinarXml(xml, keyPem, certPem) {
   const sig = new SignedXml({
@@ -347,31 +377,37 @@ function assinarXml(xml, keyPem, certPem) {
 
 // ───────────────────────── SOAP ─────────────────────────
 
-function soapEnvelope(operacao, xmlPedido) {
+function semDeclaracaoXml(xml) {
+  // A Prefeitura rejeita (HTTP 500 HTML) quando o MensagemXML carrega o prologo <?xml ...?>.
+  return String(xml || "").replace(/^\s*<\?xml[^>]*\?>\s*/i, "");
+}
+
+function soapEnvelope(operacao, xmlPedido, versao) {
+  const conteudo = `<${operacao} xmlns="http://www.prefeitura.sp.gov.br/nfe"><VersaoSchema>1</VersaoSchema><MensagemXML><![CDATA[${semDeclaracaoXml(xmlPedido)}]]></MensagemXML></${operacao}>`;
+  if (versao === 12) {
+    return `<?xml version="1.0" encoding="utf-8"?>
+<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
+<soap12:Body>${conteudo}</soap12:Body>
+</soap12:Envelope>`;
+  }
   return `<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-<soap:Body><${operacao} xmlns="http://www.prefeitura.sp.gov.br/nfe"><VersaoSchema>1</VersaoSchema><MensagemXML><![CDATA[${xmlPedido}]]></MensagemXML></${operacao}></soap:Body>
+<soap:Body>${conteudo}</soap:Body>
 </soap:Envelope>`;
 }
 
-function chamarPrefeitura({ ambiente, operacao, xmlPedido, pfxBuffer, senha }) {
-  const url = new URL(ENDPOINTS[ambiente === "producao" ? "producao" : "homologacao"]);
-  const body = Buffer.from(soapEnvelope(operacao, xmlPedido), "utf8");
+function postarSoap({ url, body, pfxBuffer, senha, headers, endpoint, versao }) {
   const options = {
     method: "POST",
     host: url.hostname,
+    servername: url.hostname,
     path: url.pathname,
     port: 443,
     pfx: pfxBuffer,
     passphrase: senha,
-    headers: {
-      "Content-Type": "text/xml; charset=utf-8",
-      "Content-Length": body.length,
-      SOAPAction: `http://www.prefeitura.sp.gov.br/nfe/${operacao}`,
-    },
+    minVersion: "TLSv1.2",
+    headers,
   };
-  const endpoint = url.toString();
-  log("07", "Enviando para Prefeitura", { endpoint, operacao, bytes_envio: body.length });
   return new Promise((resolve, reject) => {
     const req = https.request(options, (res) => {
       const chunks = [];
@@ -380,6 +416,7 @@ function chamarPrefeitura({ ambiente, operacao, xmlPedido, pfxBuffer, senha }) {
         const texto = Buffer.concat(chunks).toString("utf8");
         log("08", `Prefeitura respondeu HTTP ${res.statusCode || 0}`, {
           endpoint,
+          soap: versao === 12 ? "1.2" : "1.1",
           content_type: res.headers["content-type"] || null,
           bytes_resposta: texto.length,
         });
@@ -404,6 +441,57 @@ function chamarPrefeitura({ ambiente, operacao, xmlPedido, pfxBuffer, senha }) {
     req.end();
   });
 }
+
+async function chamarPrefeitura({ ambiente, operacao, xmlPedido, pfxBuffer, senha }) {
+  const url = new URL(ENDPOINTS[ambiente === "producao" ? "producao" : "homologacao"]);
+  const endpoint = url.toString();
+  const acao = `http://www.prefeitura.sp.gov.br/nfe/${operacao}`;
+
+  const body11 = Buffer.from(soapEnvelope(operacao, xmlPedido, 11), "utf8");
+  log("07", "Enviando para Prefeitura", { endpoint, operacao, soap: "1.1", bytes_envio: body11.length });
+  let r = await postarSoap({
+    url,
+    body: body11,
+    pfxBuffer,
+    senha,
+    endpoint,
+    versao: 11,
+    headers: {
+      "Content-Type": "text/xml; charset=utf-8",
+      "Content-Length": body11.length,
+      // SOAPAction PRECISA vir entre aspas; sem isso o IIS devolve HTTP 500 em HTML.
+      SOAPAction: `"${acao}"`,
+      Accept: "text/xml, application/soap+xml, */*",
+      "User-Agent": "HumanClinicBI-ConectorNFSe/1.0",
+      Connection: "close",
+    },
+  });
+
+  // Fallback: alguns servidores da Prefeitura so aceitam SOAP 1.2 (500 com HTML generico no 1.1).
+  const htmlErro = r.status >= 500 && /html/i.test(r.contentType || "");
+  if (htmlErro) {
+    const body12 = Buffer.from(soapEnvelope(operacao, xmlPedido, 12), "utf8");
+    log("07", "Retentando com SOAP 1.2", { endpoint, operacao, soap: "1.2", bytes_envio: body12.length });
+    const r12 = await postarSoap({
+      url,
+      body: body12,
+      pfxBuffer,
+      senha,
+      endpoint,
+      versao: 12,
+      headers: {
+        "Content-Type": `application/soap+xml; charset=utf-8; action="${acao}"`,
+        "Content-Length": body12.length,
+        Accept: "application/soap+xml, text/xml, */*",
+        "User-Agent": "HumanClinicBI-ConectorNFSe/1.0",
+        Connection: "close",
+      },
+    });
+    if (r12.status < 500 || !/html/i.test(r12.contentType || "")) r = r12;
+  }
+  return r;
+}
+
 
 
 const parser = new XMLParser({ ignoreAttributes: false, removeNSPrefix: true, parseTagValue: false });
@@ -519,6 +607,130 @@ app.post("/nfse/emitir", async (req, res) => {
       ambiente,
       rps_numero: contexto.rps_numero,
       rps_serie: contexto.rps_serie,
+    });
+  }
+});
+
+
+// ─────────────── TESTE OFICIAL (TesteEnvioLoteRPS) — NAO emite NFS-e ───────────────
+// Operacao oficial de validacao da Prefeitura de SP: valida schema, assinatura e
+// regras de negocio SEM gerar NFS-e e SEM consumir a numeracao de RPS.
+const OPERACAO_TESTE = "TesteEnvioLoteRPS";
+const OPERACOES_PROIBIDAS_NO_TESTE = ["EnvioRPS", "EnvioLoteRPS", "CancelamentoNFe"];
+
+const logT = (etapa, msg, extra) =>
+  console.log(`[TESTE-NFSE-SP] ${etapa} - ${msg}${extra ? " " + JSON.stringify(extra) : ""} @ ${ts()}`);
+
+function interpretarTeste(xml) {
+  const doc = parser.parse(xml || "");
+  const flat = JSON.stringify(doc);
+  const sucesso = /"Sucesso":"?true/i.test(flat);
+  const codigo = /"Codigo":"?([^",}]+)/i.exec(flat)?.[1] || null;
+  const mensagem =
+    /"Descricao":"([^"]+)"/i.exec(flat)?.[1] || /"Mensagem":"([^"]+)"/i.exec(flat)?.[1] || null;
+  const texto = `${codigo || ""} ${mensagem || ""}`.toLowerCase();
+  const assinatura = /assinatura/.test(texto) ? "NAO" : sucesso ? "SIM" : "NAO IDENTIFICADO";
+  const schema = /schema|xml|elemento|inv[aá]lid/.test(texto) ? "NAO" : sucesso ? "SIM" : "NAO IDENTIFICADO";
+  return { sucesso, codigo, mensagem, assinatura, schema, retorno: doc };
+}
+
+app.post("/nfse/testar-xml", async (req, res) => {
+  let etapa = "03";
+  const p = req.body || {};
+  const ambiente = p.ambiente === "producao" ? "producao" : "homologacao";
+  const endpoint = ENDPOINTS[ambiente];
+  logT("01", "Requisicao recebida", { ambiente, endpoint });
+  logT("02", "Token validado");
+
+  // Trava explicita: esta rota so pode falar com a operacao oficial de TESTE.
+  if (OPERACOES_PROIBIDAS_NO_TESTE.includes(OPERACAO_TESTE)) {
+    logErro("TESTE", "Operacao de emissao bloqueada na rota de teste");
+    return res.status(400).json({ erro: "Teste cancelado: operacao de emissao detectada." });
+  }
+
+  try {
+    const { keyPem, certPem, pfxBuffer } = lerCertificado(
+      p.certificado?.pfx_base64,
+      p.certificado?.senha,
+    );
+    logT("03", "PFX aberto", { chave_privada: Boolean(keyPem), certificado: Boolean(certPem) });
+
+    etapa = "04";
+    const pedido = xmlTesteEnvioLoteRps(p, keyPem);
+    logT("04", "XML de teste montado", { bytes: pedido.length, operacao: OPERACAO_TESTE });
+
+    etapa = "05";
+    const xml = assinarXml(pedido, keyPem, certPem);
+    const validacao = {
+      uri_referencia_vazia: /URI=""/.test(xml),
+      id_na_raiz: /<PedidoEnvioLoteRPS[^>]*\sId=/i.test(xml),
+      assinatura_ultimo_filho: /<\/(\w+:)?Signature>\s*<\/PedidoEnvioLoteRPS>/i.test(xml),
+      endereco_tomador: /<EnderecoTomador>/.test(xml) ? "presente" : "omitido",
+    };
+    logT("05", "XML assinado", { bytes: xml.length, ...validacao });
+
+    etapa = "06";
+    logT("06", "Iniciando mTLS", { endpoint });
+
+    etapa = "07";
+    logT("07", "SOAP enviado para operacao de TESTE", { operacao: OPERACAO_TESTE });
+    const r = await chamarPrefeitura({
+      ambiente,
+      operacao: OPERACAO_TESTE,
+      xmlPedido: xml,
+      pfxBuffer,
+      senha: p.certificado.senha,
+    });
+
+    etapa = "08";
+    logT("08", `Prefeitura respondeu HTTP ${r.status}`, {
+      content_type: r.contentType,
+      bytes: r.body.length,
+    });
+
+    etapa = "09";
+    const info = interpretarTeste(r.body);
+    logT("09", "Resultado interpretado", {
+      sucesso: info.sucesso,
+      codigo: info.codigo,
+      mensagem: info.mensagem,
+    });
+
+    res.json({
+      mtls: r.status > 0 ? "OK" : "ERRO",
+      soap: r.status === 200 ? "OK" : "ERRO",
+      http_status: r.status,
+      content_type: r.contentType,
+      xml_aceito: info.sucesso ? "SIM" : "NAO",
+      assinatura_aceita: info.assinatura,
+      schema_aceito: info.schema,
+      codigo_prefeitura: info.codigo,
+      mensagem_prefeitura: info.mensagem,
+      endpoint: r.endpoint,
+      operacao: OPERACAO_TESTE,
+      versao_schema: "1",
+      layout: 1,
+      validacao_local: validacao,
+      nfse_emitida: false,
+      rps_consumido: false,
+      resposta_trecho: sanitiza(r.body, 2000),
+    });
+  } catch (e) {
+    const nomeEtapa =
+      { "03": "abertura do PFX", "04": "montagem do XML", "05": "assinatura do XML", "06": "mTLS", "07": "envio SOAP de teste", "08": "resposta da Prefeitura", "09": "interpretacao" }[etapa] ||
+      "desconhecida";
+    logErro(etapa, `Falha no teste oficial (${nomeEtapa})`, {
+      erro: e?.message || String(e),
+      code: e?.code || null,
+    });
+    res.status(500).json({
+      etapa: `${etapa} - ${nomeEtapa}`,
+      erro: e?.message || String(e),
+      code: e?.code || null,
+      endpoint,
+      operacao: OPERACAO_TESTE,
+      nfse_emitida: false,
+      rps_consumido: false,
     });
   }
 });
