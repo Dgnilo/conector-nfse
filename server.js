@@ -27,6 +27,13 @@ app.use((req, res, next) => {
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
+// Diagnostico autenticado: apenas confirma o token. Nao emite nada,
+// nao gera RPS e nao fala com a Prefeitura.
+app.get("/diagnostico", (_req, res) =>
+  res.json({ ok: true, autenticado: true, servico: "conector-nfse", versao: 1 }),
+);
+
+
 // ───────────────────────── certificado ─────────────────────────
 
 function lerCertificado(pfxBase64, senha) {
