@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: conector-nfse
+    runtime: node
+    region: ohio
+    plan: free
+    branch: main
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: CONECTOR_TOKEN
+        generateValue: true
+      - key: NODE_VERSION
+        value: 20
+    healthCheckPath: /health
