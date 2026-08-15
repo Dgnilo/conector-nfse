@@ -1084,18 +1084,211 @@ const OPERACOES_PROIBIDAS_NO_TESTE = ["EnvioRPS", "EnvioLoteRPS", "CancelamentoN
 const logT = (etapa, msg, extra) =>
   console.log(`[TESTE-NFSE-SP] ${etapa} - ${msg}${extra ? " " + JSON.stringify(extra) : ""} @ ${ts()}`);
 
-function interpretarTeste(xml) {
-  const doc = parser.parse(xml || "");
-  const flat = JSON.stringify(doc);
-  const sucesso = /"Sucesso":"?true/i.test(flat);
-  const codigo = /"Codigo":"?([^",}]+)/i.exec(flat)?.[1] || null;
-  const mensagem =
-    /"Descricao":"([^"]+)"/i.exec(flat)?.[1] || /"Mensagem":"([^"]+)"/i.exec(flat)?.[1] || null;
-  const texto = `${codigo || ""} ${mensagem || ""}`.toLowerCase();
-  const assinatura = /assinatura/.test(texto) ? "NAO" : sucesso ? "SIM" : "NAO IDENTIFICADO";
-  const schema = /schema|xml|elemento|inv[aá]lid/.test(texto) ? "NAO" : sucesso ? "SIM" : "NAO IDENTIFICADO";
-  return { sucesso, codigo, mensagem, assinatura, schema, retorno: doc };
+// Parser sem remocao de prefixo: precisamos inspecionar o Body por local-name().
+const parserBruto = new XMLParser({ ignoreAttributes: false, parseTagValue: false, processEntities: true });
+
+const nomeLocal = (k) => String(k).replace(/^.*:/, "");
+
+function decodificarEntidades(s) {
+  return String(s || "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
 }
+
+/** Colhe recursivamente pares Codigo/Descricao de Erro/Alerta do XML municipal. */
+function coletarOcorrencias(no, tipo, saida) {
+  if (!no || typeof no !== "object") return saida;
+  for (const [k, v] of Object.entries(no)) {
+    const nome = nomeLocal(k);
+    const lista = Array.isArray(v) ? v : [v];
+    if (nome === tipo) {
+      for (const item of lista) {
+        if (item && typeof item === "object") {
+          saida.push({
+            tipo,
+            codigo: item.Codigo != null ? String(item.Codigo) : null,
+            mensagem: item.Descricao != null ? String(item.Descricao) : null,
+            correcao: item.Correcao != null ? String(item.Correcao) : null,
+          });
+        } else if (item != null) {
+          saida.push({ tipo, codigo: null, mensagem: String(item), correcao: null });
+        }
+      }
+    } else {
+      for (const item of lista) coletarOcorrencias(item, tipo, saida);
+    }
+  }
+  return saida;
+}
+
+/**
+ * Auditoria da resposta SOAP do TesteEnvioLoteRPS.
+ * Nao assume nomes: localiza Body por local-name, o filho *Response e dentro dele *Result.
+ */
+function auditarRespostaSoap(bruto) {
+  const texto = String(bruto || "");
+  const out = {
+    primeiro_elemento: /<\s*([A-Za-z_][\w.:-]*)/.exec(texto)?.[1] || null,
+    soap_response_encontrado: "NAO",
+    elemento_response: null,
+    result_encontrado: "NAO",
+    elemento_result: null,
+    formato_result: null,
+    xml_municipal_encontrado: "NAO",
+    raiz_municipal: null,
+    sucesso: "INDETERMINADO",
+    ocorrencias: [],
+    codigo: null,
+    mensagem: null,
+    correcao: null,
+    soap_fault: null,
+  };
+
+  let doc;
+  try {
+    doc = parserBruto.parse(texto);
+  } catch (e) {
+    out.mensagem = `Resposta nao pode ser parseada como XML: ${e?.message || String(e)}`;
+    return out;
+  }
+
+  // 1) Envelope → Body por local-name
+  const envKey = Object.keys(doc || {}).find((k) => nomeLocal(k) === "Envelope");
+  const env = envKey ? doc[envKey] : null;
+  const bodyKey = env ? Object.keys(env).find((k) => nomeLocal(k) === "Body") : null;
+  const body = bodyKey ? env[bodyKey] : null;
+  if (!body || typeof body !== "object") {
+    out.mensagem = "soap:Body nao localizado na resposta.";
+    return out;
+  }
+
+  const faultKey = Object.keys(body).find((k) => nomeLocal(k) === "Fault");
+  if (faultKey) {
+    const f = body[faultKey] || {};
+    out.soap_fault = String(f.faultstring || f.Reason?.Text || "SOAP Fault");
+    out.mensagem = out.soap_fault;
+    out.sucesso = "NAO";
+    return out;
+  }
+
+  // 2) filho *Response
+  const respKey =
+    Object.keys(body).find((k) => /Response$/i.test(nomeLocal(k))) || Object.keys(body)[0] || null;
+  if (!respKey) {
+    out.mensagem = "Nenhum elemento dentro de soap:Body.";
+    return out;
+  }
+  out.soap_response_encontrado = "SIM";
+  out.elemento_response = nomeLocal(respKey);
+  const resp = body[respKey];
+
+  // 3) *Result
+  if (!resp || typeof resp !== "object") {
+    out.mensagem = "Elemento Response sem conteudo.";
+    return out;
+  }
+  const resultKey =
+    Object.keys(resp).find((k) => /Result$/i.test(nomeLocal(k))) ||
+    Object.keys(resp).find((k) => !k.startsWith("@_")) ||
+    null;
+  if (!resultKey) {
+    out.mensagem = "Elemento Result nao localizado dentro do Response.";
+    return out;
+  }
+  out.result_encontrado = "SIM";
+  out.elemento_result = nomeLocal(resultKey);
+  const result = resp[resultKey];
+
+  // 4) formato do conteudo do Result
+  const trechoResult = new RegExp(
+    `<[^>]*${out.elemento_result}[^>]*>([\\s\\S]*?)<\\/[^>]*${out.elemento_result}>`,
+    "i",
+  ).exec(texto)?.[1];
+  let xmlInterno = null;
+  if (result && typeof result === "object") {
+    out.formato_result = "XML direto";
+    const raizKey = Object.keys(result).find((k) => !k.startsWith("@_"));
+    out.raiz_municipal = raizKey ? nomeLocal(raizKey) : null;
+    out.xml_municipal_encontrado = raizKey ? "SIM" : "NAO";
+    coletarOcorrencias(result, "Erro", out.ocorrencias);
+    coletarOcorrencias(result, "Alerta", out.ocorrencias);
+    const flat = JSON.stringify(result);
+    out.sucesso = /"Sucesso":"?true/i.test(flat) ? "SIM" : out.ocorrencias.length ? "NAO" : "INDETERMINADO";
+    return finalizarAuditoria(out);
+  }
+  if (trechoResult && /<!\[CDATA\[/.test(trechoResult)) {
+    out.formato_result = "CDATA";
+    xmlInterno = /<!\[CDATA\[([\s\S]*?)\]\]>/.exec(trechoResult)?.[1] || null;
+  } else if (trechoResult && /&lt;/.test(trechoResult)) {
+    out.formato_result = "XML escapado";
+    xmlInterno = decodificarEntidades(trechoResult);
+  } else if (typeof result === "string" && /<[A-Za-z]/.test(result)) {
+    out.formato_result = "XML escapado";
+    xmlInterno = result;
+  } else {
+    out.formato_result = "string";
+    out.mensagem = result != null ? String(result).slice(0, 400) : null;
+    return finalizarAuditoria(out);
+  }
+
+  if (!xmlInterno || !/<[A-Za-z]/.test(xmlInterno)) return finalizarAuditoria(out);
+
+  let municipal;
+  try {
+    municipal = parser.parse(xmlInterno);
+  } catch (e) {
+    out.mensagem = `XML municipal nao parseavel: ${e?.message || String(e)}`;
+    return finalizarAuditoria(out);
+  }
+  out.xml_municipal_encontrado = "SIM";
+  out.raiz_municipal = Object.keys(municipal || {}).find((k) => !k.startsWith("?")) || null;
+  coletarOcorrencias(municipal, "Erro", out.ocorrencias);
+  coletarOcorrencias(municipal, "Alerta", out.ocorrencias);
+  const flat = JSON.stringify(municipal);
+  const temErro = out.ocorrencias.some((o) => o.tipo === "Erro");
+  out.sucesso = /"Sucesso":"?true/i.test(flat) && !temErro ? "SIM" : temErro ? "NAO" : "INDETERMINADO";
+  return finalizarAuditoria(out);
+}
+
+function finalizarAuditoria(out) {
+  const principal = out.ocorrencias.find((o) => o.tipo === "Erro") || out.ocorrencias[0] || null;
+  if (principal) {
+    out.codigo = principal.codigo;
+    out.mensagem = principal.mensagem || out.mensagem;
+    out.correcao = principal.correcao;
+  }
+  return out;
+}
+
+function interpretarTeste(xml) {
+  const a = auditarRespostaSoap(xml);
+  const texto = `${a.codigo || ""} ${a.mensagem || ""}`.toLowerCase();
+  const sucesso = a.sucesso === "SIM";
+  const assinatura = /assinatura|signature|certificad/.test(texto)
+    ? "NAO"
+    : sucesso
+      ? "SIM"
+      : a.sucesso === "NAO"
+        ? "SIM"
+        : "NAO IDENTIFICADO";
+  const schema = /schema|xsd|elemento|estrutura|inv[aá]lid|xml/.test(texto)
+    ? "NAO"
+    : sucesso
+      ? "SIM"
+      : "NAO IDENTIFICADO";
+  return {
+    sucesso,
+    codigo: a.codigo,
+    mensagem: a.mensagem,
+    assinatura,
+    schema,
+    auditoria: a,
+  };
+}
+
 
 app.post("/nfse/testar-xml", async (req, res) => {
   let etapa = "03";
@@ -1211,10 +1404,20 @@ app.post("/nfse/testar-xml", async (req, res) => {
 
     etapa = "09";
     const info = interpretarTeste(r.body);
-    logT("09", "Resultado interpretado", {
-      sucesso: info.sucesso,
-      codigo: info.codigo,
-      mensagem: info.mensagem,
+    const a = info.auditoria;
+    logT("09", "Resposta SOAP auditada", {
+      http_status: r.status,
+      content_type: r.contentType,
+      bytes: Buffer.byteLength(r.body || "", "utf8"),
+      primeiro_elemento: a.primeiro_elemento,
+      elemento_response: a.elemento_response,
+      elemento_result: a.elemento_result,
+      formato_result: a.formato_result,
+      raiz_municipal: a.raiz_municipal,
+      sucesso: a.sucesso,
+      ocorrencias: a.ocorrencias.length,
+      codigo: a.codigo,
+      mensagem: a.mensagem,
     });
 
     res.json({
@@ -1229,14 +1432,32 @@ app.post("/nfse/testar-xml", async (req, res) => {
       soap_action: r.contrato?.acao ?? null,
       http_status: r.status,
       content_type: r.contentType,
+      bytes_resposta: Buffer.byteLength(r.body || "", "utf8"),
       xml_valido_xsd: "SIM",
       assinatura_municipal: "OK",
+      assinatura_municipal_bytes: municipal.bytes,
       xmldsig_local: "SIM",
-      xml_aceito: info.sucesso ? "SIM" : "NAO",
+      xml_aceito: a.sucesso === "SIM" ? "SIM" : "NAO",
       assinatura_aceita: info.assinatura,
       schema_aceito: info.schema,
       codigo_prefeitura: info.codigo,
       mensagem_prefeitura: info.mensagem,
+      // Auditoria completa da resposta municipal
+      resposta_municipal: {
+        primeiro_elemento: a.primeiro_elemento,
+        soap_response_encontrado: a.soap_response_encontrado,
+        elemento_response: a.elemento_response,
+        result_encontrado: a.result_encontrado,
+        elemento_result: a.elemento_result,
+        formato_result: a.formato_result,
+        xml_municipal_encontrado: a.xml_municipal_encontrado,
+        raiz_municipal: a.raiz_municipal,
+        sucesso: a.sucesso,
+        soap_fault: a.soap_fault,
+        correcao: a.correcao,
+        ocorrencias: a.ocorrencias,
+      },
+      teste_oficial: a.sucesso === "SIM" ? "APROVADO" : "REJEITADO",
       endpoint: r.endpoint,
       operacao: OPERACAO_TESTE,
       versao_schema: "1",
@@ -1248,6 +1469,7 @@ app.post("/nfse/testar-xml", async (req, res) => {
       rps_incrementado: false,
       resposta_trecho: sanitiza(r.body, 2000),
     });
+
 
   } catch (e) {
     const nomeEtapa =
