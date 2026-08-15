@@ -336,10 +336,21 @@ ${rpsXml(p, keyPem)}
 </PedidoEnvioRPS>`;
 }
 
+/** Data corrente no fuso fiscal America/Sao_Paulo (AAAA-MM-DD). Nunca UTC puro. */
+function dataHojeSaoPaulo() {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
 /**
  * PedidoEnvioLoteRPS usado APENAS na operacao oficial de TESTE (TesteEnvioLoteRPS).
  * A Prefeitura valida schema, assinatura e regras sem gerar NFS-e.
  */
+
 function xmlTesteEnvioLoteRps(p, keyPem) {
   const cnpjPrestador = zeros(p.prestador.cnpj, 14);
   const data = so(p.rps.data_emissao).slice(0, 10);
@@ -1305,6 +1316,30 @@ app.post("/nfse/testar-xml", async (req, res) => {
   }
 
   try {
+    // FASE 3.0 — datas fiscais no fuso America/Sao_Paulo (nunca UTC puro).
+    const hojeSP = dataHojeSaoPaulo();
+    const dataRps = so(p.rps?.data_emissao).slice(0, 10);
+    logT("03", "Datas fiscais avaliadas", {
+      data_atual_sp: hojeSP,
+      data_emissao_rps: dataRps,
+      dt_inicio: dataRps,
+      dt_fim: dataRps,
+    });
+    if (!dataRps || dataRps > hojeSP) {
+      return res.status(422).json({
+        etapa: "03 - datas fiscais",
+        transmitido: false,
+        elegivel: "NAO",
+        erro: "RPS NÃO ELEGÍVEL PARA TESTE — DATA DE EMISSÃO FUTURA",
+        data_atual_sp: hojeSP,
+        data_emissao_rps: dataRps || null,
+        dt_inicio_lote: dataRps || null,
+        dt_fim_lote: dataRps || null,
+        nfse_emitida: false,
+        rps_consumido: false,
+      });
+    }
+
     // FASE 3 — validacao de dados ANTES de qualquer transmissao.
     const errosDados = validarDados(p);
     if (errosDados.length) {
@@ -1317,6 +1352,7 @@ app.post("/nfse/testar-xml", async (req, res) => {
         rps_consumido: false,
       });
     }
+
 
     const { keyPem, certPem, pfxBuffer } = lerCertificado(
       p.certificado?.pfx_base64,
@@ -1462,6 +1498,12 @@ app.post("/nfse/testar-xml", async (req, res) => {
       operacao: OPERACAO_TESTE,
       versao_schema: "1",
       layout: 1,
+      elegivel: "SIM",
+      data_atual_sp: hojeSP,
+      data_emissao_rps: dataRps,
+      dt_inicio_lote: dataRps,
+      dt_fim_lote: dataRps,
+
       validacao_local: validacao,
       transmitido: true,
       nfse_emitida: false,
