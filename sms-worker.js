@@ -1,7 +1,7 @@
 import { client } from "@larvit/smpp";
 
 const DEFAULT_BI_BASE =
-  "https://project--ed9f90bf-a256-4657-90c6-6edd42431c41.lovable.app";
+  "https://humanclinicbi.lovable.app";
 
 const GSM7_BASIC =
   "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà";
