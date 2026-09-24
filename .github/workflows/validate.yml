@@ -1,0 +1,36 @@
+name: Validate Connector
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Syntax check
+        run: |
+          node --check server.js
+          node --check sms-worker.js
+
+      - name: Start simulator
+        run: |
+          CONECTOR_TOKEN=ci-test \
+          BI_BASE_URL=http://127.0.0.1:9 \
+          SMS_TRANSPORT=simulator \
+          PORT=8080 \
+          node server.js > /tmp/connector.log 2>&1 &
+          PID=$!
+          sleep 3
+          curl --fail --silent http://127.0.0.1:8080/health | grep '"ok":true'
+          kill $PID
