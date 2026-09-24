@@ -23,9 +23,7 @@ function estimateSegments(text) {
   if (gsm) return septets <= 160 ? 1 : Math.ceil(septets / 153);
 
   let units = 0;
-  for (const ch of Array.from(String(text || ""))) {
-    units += ch.length;
-  }
+  for (const ch of Array.from(String(text || ""))) units += ch.length;
   return units <= 70 ? 1 : Math.ceil(units / 67);
 }
 
@@ -34,26 +32,125 @@ function sleep(ms) {
 }
 
 function mapDlrStatus(value) {
-  const s = String(value || "").toUpperCase();
-  if (/DELIVERED|DELIVRD/.test(s)) return "delivered";
-  if (/UNDELIVERABLE|UNDELIV|EXPIRED|REJECTED|REJECTD|DELETED|UNKNOWN|FAILED/.test(s)) {
+  const status = String(value || "").toUpperCase();
+  if (/DELIVERED|DELIVRD/.test(status)) return "delivered";
+  if (
+    /UNDELIVERABLE|UNDELIV|EXPIRED|REJECTED|REJECTD|DELETED|UNKNOWN|FAILED/.test(
+      status,
+    )
+  ) {
     return "failed";
   }
-  if (/ACCEPTED|ENROUTE|SCHEDULED/.test(s)) return "submitted";
+  if (/ACCEPTED|ENROUTE|SCHEDULED/.test(status)) return "submitted";
   return null;
 }
 
-export function installSmsGateway(app, { token }) {
-  const BI_BASE_URL = String(process.env.BI_BASE_URL || DEFAULT_BI_BASE).replace(/\/$/, "");
-  const MODE = String(process.env.SMS_TRANSPORT || "simulator").toLowerCase();
-  const BATCH = Math.max(1, Math.min(Number(process.env.SMS_BATCH_SIZE || 50), 500));
-  const TPS = Math.max(1, Number(process.env.SMS_TPS || 10));
-  const POLL_MS = Math.max(1000, Number(process.env.SMS_POLL_INTERVAL_MS || 5000));
+function clamp(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(n, max));
+}
 
+function normalizeRuntimeConfig(input) {
+  const mode = input?.mode === "smpp" ? "smpp" : "simulator";
+
+  return {
+    mode,
+    host: String(input?.host || "").trim(),
+    port: clamp(input?.port, 1, 65535, 2775),
+    system_id: String(input?.system_id || "").trim(),
+    password: String(input?.password || ""),
+    system_type: String(input?.system_type || "").trim(),
+    source_addr: String(input?.source_addr || "HUMANCLINIC").trim() || "HUMANCLINIC",
+    tls: Boolean(input?.tls),
+    tps: clamp(input?.tps, 1, 500, 10),
+    max_segments: clamp(input?.max_segments, 1, 20, 10),
+  };
+}
+
+function envRuntimeConfig() {
+  const explicitMode = String(process.env.SMS_TRANSPORT || "").toLowerCase();
+  if (explicitMode !== "simulator" && explicitMode !== "smpp") return null;
+
+  return normalizeRuntimeConfig({
+    mode: explicitMode,
+    host: process.env.SMPP_HOST,
+    port: process.env.SMPP_PORT,
+    system_id: process.env.SMPP_SYSTEM_ID,
+    password: process.env.SMPP_PASSWORD,
+    system_type: process.env.SMPP_SYSTEM_TYPE,
+    source_addr: process.env.SMPP_SOURCE_ADDR,
+    tls: String(process.env.SMPP_TLS || "").toLowerCase() === "true",
+    tps: process.env.SMS_TPS,
+    max_segments: process.env.SMS_MAX_SEGMENTS,
+  });
+}
+
+export function installSmsGateway(app, { token }) {
+  const BI_BASE_URL = String(
+    process.env.BI_BASE_URL || DEFAULT_BI_BASE,
+  ).replace(/\/$/, "");
+  const BATCH = clamp(process.env.SMS_BATCH_SIZE, 1, 500, 50);
+  const POLL_MS = clamp(process.env.SMS_POLL_INTERVAL_MS, 1000, 60000, 5000);
+
+  let runtimeConfig = envRuntimeConfig();
   let session = null;
-  let connected = MODE === "simulator";
+  let connected = runtimeConfig?.mode === "simulator";
   let connecting = null;
   let working = false;
+  let configVersion = 0;
+
+  function currentConfig() {
+    return runtimeConfig;
+  }
+
+  function closeSession() {
+    const old = session;
+    session = null;
+    connected = false;
+    connecting = null;
+
+    if (!old) return;
+
+    try {
+      if (typeof old.close === "function") old.close();
+      else if (typeof old.destroy === "function") old.destroy();
+    } catch (error) {
+      console.warn(
+        "[SMS][SMPP] falha ao encerrar sessão antiga:",
+        error?.message || String(error),
+      );
+    }
+  }
+
+  function setRuntimeConfig(input) {
+    const next = normalizeRuntimeConfig(input);
+
+    if (
+      next.mode === "smpp" &&
+      (!next.host || !next.system_id || !next.password)
+    ) {
+      throw new Error(
+        "Configuração SMPP incompleta: host, System ID e senha são obrigatórios.",
+      );
+    }
+
+    // Nunca logar o conteúdo da configuração: ela contém a senha SMPP.
+    closeSession();
+    runtimeConfig = next;
+    connected = next.mode === "simulator";
+    configVersion += 1;
+
+    return {
+      mode: next.mode,
+      configured: true,
+      source_addr: next.source_addr,
+      tls: next.tls,
+      tps: next.tps,
+      max_segments: next.max_segments,
+      version: configVersion,
+    };
+  }
 
   async function post(path, body) {
     const response = await fetch(BI_BASE_URL + path, {
@@ -67,7 +164,9 @@ export function installSmsGateway(app, { token }) {
 
     if (!response.ok) {
       const text = await response.text().catch(() => "");
-      throw new Error(path + " -> HTTP " + response.status + " " + text.slice(0, 200));
+      throw new Error(
+        path + " -> HTTP " + response.status + " " + text.slice(0, 200),
+      );
     }
 
     return response.json().catch(() => ({}));
@@ -77,7 +176,10 @@ export function installSmsGateway(app, { token }) {
     try {
       await post("/api/public/sms/dlr", body);
     } catch (error) {
-      console.error("[SMS][DLR] callback falhou:", error?.message || String(error));
+      console.error(
+        "[SMS][DLR] callback falhou:",
+        error?.message || String(error),
+      );
     }
   }
 
@@ -85,37 +187,50 @@ export function installSmsGateway(app, { token }) {
     try {
       await post("/api/public/sms/inbound", body);
     } catch (error) {
-      console.error("[SMS][INBOUND] callback falhou:", error?.message || String(error));
+      console.error(
+        "[SMS][INBOUND] callback falhou:",
+        error?.message || String(error),
+      );
     }
   }
 
   async function ensureSession() {
-    if (MODE === "simulator") return null;
-    if (MODE !== "smpp") throw new Error("SMS_TRANSPORT inválido: " + MODE);
+    const cfg = currentConfig();
+
+    if (!cfg) {
+      throw new Error(
+        "Configuração SMS ainda não foi carregada pelo Cockpit.",
+      );
+    }
+
+    if (cfg.mode === "simulator") return null;
     if (session && connected) return session;
     if (connecting) return connecting;
 
-    const host = String(process.env.SMPP_HOST || "").trim();
-    const username = String(process.env.SMPP_SYSTEM_ID || "").trim();
-    const password = String(process.env.SMPP_PASSWORD || "");
-
-    if (!host || !username || !password) {
-      throw new Error("Credenciais SMPP não configuradas.");
-    }
+    const connectingVersion = configVersion;
 
     connecting = (async () => {
       const result = await client({
-        host,
-        port: Number(process.env.SMPP_PORT || 2775),
-        username,
-        password,
+        host: cfg.host,
+        port: cfg.port,
+        username: cfg.system_id,
+        password: cfg.password,
         bindType: "transceiver",
-        systemType: String(process.env.SMPP_SYSTEM_TYPE || ""),
-        tls: String(process.env.SMPP_TLS || "").toLowerCase() === "true",
+        systemType: cfg.system_type,
+        tls: cfg.tls,
         enquireLinkInterval: 20000,
         responseTimeout: 30000,
-        maxOutstanding: Math.max(1, Math.min(Number(process.env.SMPP_WINDOW || 10), 50)),
+        maxOutstanding: 10,
       });
+
+      if (connectingVersion !== configVersion) {
+        try {
+          result.session?.close?.();
+        } catch {}
+        throw new Error(
+          "Configuração SMPP mudou durante a conexão; tente novamente.",
+        );
+      }
 
       if (result.err || !result.session) {
         connected = false;
@@ -127,7 +242,9 @@ export function installSmsGateway(app, { token }) {
 
       session.on("disconnected", () => {
         connected = false;
-        console.warn("[SMS][SMPP] conexão interrompida; biblioteca tentará reconectar.");
+        console.warn(
+          "[SMS][SMPP] conexão interrompida; aguardando reconexão.",
+        );
       });
 
       session.on("reconnected", () => {
@@ -142,7 +259,10 @@ export function installSmsGateway(app, { token }) {
       });
 
       session.on("sessionError", (error) => {
-        console.error("[SMS][SMPP] erro de sessão:", error?.message || String(error));
+        console.error(
+          "[SMS][SMPP] erro de sessão:",
+          error?.message || String(error),
+        );
       });
 
       session.on("dlr", async (dlr) => {
@@ -164,18 +284,23 @@ export function installSmsGateway(app, { token }) {
             from: String(sms?.from || ""),
             to: String(sms?.to || ""),
             text: String(sms?.message || ""),
-            provider_message_id: sms?.smsId ? String(sms.smsId) : null,
+            provider_message_id: sms?.smsId
+              ? String(sms.smsId)
+              : null,
           });
         } finally {
           try {
             await sms.sendResp();
           } catch (error) {
-            console.error("[SMS][SMPP] falha ao responder MO:", error?.message || String(error));
+            console.error(
+              "[SMS][SMPP] falha ao responder MO:",
+              error?.message || String(error),
+            );
           }
         }
       });
 
-      console.log("[SMS][SMPP] sessão conectada em", host);
+      console.log("[SMS][SMPP] sessão conectada.");
       return session;
     })();
 
@@ -188,9 +313,17 @@ export function installSmsGateway(app, { token }) {
 
   async function submit(message) {
     const logicalId = String(message.id);
+    const cfg = currentConfig();
 
-    if (MODE === "simulator") {
-      const count = Math.max(1, estimateSegments(message.mensagem_final));
+    if (!cfg) {
+      throw new Error("Configuração SMS não carregada.");
+    }
+
+    if (cfg.mode === "simulator") {
+      const count = Math.max(
+        1,
+        estimateSegments(message.mensagem_final),
+      );
       const ids = Array.from(
         { length: count },
         (_, index) =>
@@ -223,12 +356,15 @@ export function installSmsGateway(app, { token }) {
     const smpp = await ensureSession();
     const result = await smpp.sendSms(
       {
-        from:
-          String(message.sender_id || process.env.SMPP_SOURCE_ADDR || "HUMANCLINIC"),
+        from: String(
+          message.sender_id ||
+            cfg.source_addr ||
+            "HUMANCLINIC",
+        ),
         to: String(message.telefone_e164),
         message: String(message.mensagem_final),
         dlr: true,
-        maxSegments: Math.max(1, Math.min(Number(process.env.SMS_MAX_SEGMENTS || 10), 20)),
+        maxSegments: cfg.max_segments,
       },
       { signal: AbortSignal.timeout(45000) },
     );
@@ -239,12 +375,18 @@ export function installSmsGateway(app, { token }) {
 
     if (result.err || Number(result.unanswered || 0) > 0) {
       const accepted = acceptedIds.length > 0;
+
       await report({
         client_ref: logicalId,
         status: "failed",
         error:
-          (accepted ? "INDETERMINADO - NÃO REENVIAR AUTOMATICAMENTE. " : "") +
-          String(result.err?.message || "SMSC não respondeu a todos os segmentos."),
+          (accepted
+            ? "INDETERMINADO - NÃO REENVIAR AUTOMATICAMENTE. "
+            : "") +
+          String(
+            result.err?.message ||
+              "SMSC não respondeu a todos os segmentos.",
+          ),
         provider_message_ids: acceptedIds,
         unanswered: Number(result.unanswered || 0),
       });
@@ -269,7 +411,12 @@ export function installSmsGateway(app, { token }) {
   }
 
   async function pollOnce() {
-    const response = await post("/api/public/sms/queue", { limit: BATCH });
+    const cfg = currentConfig();
+    if (!cfg) return 0;
+
+    const response = await post("/api/public/sms/queue", {
+      limit: BATCH,
+    });
     const messages = response.messages || [];
 
     for (const message of messages) {
@@ -283,75 +430,108 @@ export function installSmsGateway(app, { token }) {
         });
       }
 
-      await sleep(Math.ceil(1000 / TPS));
+      await sleep(Math.ceil(1000 / cfg.tps));
     }
 
     return messages.length;
   }
 
   async function kick() {
-    if (working || !token || !BI_BASE_URL) return;
+    if (working || !token || !BI_BASE_URL || !currentConfig()) return;
     working = true;
 
     try {
-      if (MODE === "smpp") await ensureSession();
+      if (currentConfig()?.mode === "smpp") await ensureSession();
 
       for (let round = 0; round < 200; round++) {
         const count = await pollOnce();
         if (!count) break;
       }
     } catch (error) {
-      console.error("[SMS][WORKER]", error?.message || String(error));
+      console.error(
+        "[SMS][WORKER]",
+        error?.message || String(error),
+      );
     } finally {
       working = false;
     }
   }
 
   app.get("/sms/health", async (_req, res) => {
-    let routeReady = MODE === "simulator";
-
-    if (MODE === "smpp") {
-      try {
-        await ensureSession();
-        routeReady = connected;
-      } catch {
-        routeReady = false;
-      }
-    }
+    const cfg = currentConfig();
 
     res.json({
       ok: true,
       service: "human-sms-gateway",
-      mode: MODE,
-      connected: routeReady,
+      mode: cfg?.mode ?? "idle",
+      connected:
+        cfg?.mode === "simulator"
+          ? true
+          : cfg?.mode === "smpp"
+            ? connected
+            : false,
       worker_busy: working,
-      tps: TPS,
+      tps: cfg?.tps ?? 0,
       batch: BATCH,
       bi_configured: Boolean(BI_BASE_URL),
       smpp_configured:
-        MODE === "simulator" ||
+        cfg?.mode === "simulator" ||
         Boolean(
-          process.env.SMPP_HOST &&
-            process.env.SMPP_SYSTEM_ID &&
-            process.env.SMPP_PASSWORD,
+          cfg?.host &&
+            cfg?.system_id &&
+            cfg?.password,
         ),
+      config_version: configVersion,
     });
   });
 
-  app.post("/sms/process", (_req, res) => {
+  app.post("/sms/process", (req, res) => {
+    let applied = null;
+
+    try {
+      if (req.body?.config) {
+        applied = setRuntimeConfig(req.body.config);
+      } else if (!currentConfig()) {
+        throw new Error(
+          "Configuração SMS ausente. Abra Configurações SMS no Cockpit.",
+        );
+      }
+    } catch (error) {
+      return res.status(422).json({
+        ok: false,
+        error: error?.message || String(error),
+      });
+    }
+
     void kick();
-    res.status(202).json({
+
+    return res.status(202).json({
       ok: true,
       accepted: true,
-      mode: MODE,
+      mode: currentConfig()?.mode ?? "idle",
       worker_busy: true,
+      config: applied
+        ? {
+            mode: applied.mode,
+            source_addr: applied.source_addr,
+            tls: applied.tls,
+            tps: applied.tps,
+            max_segments: applied.max_segments,
+            version: applied.version,
+          }
+        : null,
     });
   });
 
-  // Enquanto o serviço estiver acordado, continua drenando a fila.
+  // Em produção sem config em variável de ambiente, o serviço fica "idle"
+  // após um restart. O Cockpit injeta a configuração descriptografada em memória
+  // no primeiro teste/envio. Isso impede envio simulado acidental.
   setInterval(() => {
-    void kick();
+    if (currentConfig()) void kick();
   }, POLL_MS);
 
-  console.log("[SMS] Human SMS Gateway instalado em modo", MODE);
+  console.log(
+    "[SMS] Human SMS Gateway instalado em modo",
+    currentConfig()?.mode ?? "idle",
+  );
 }
