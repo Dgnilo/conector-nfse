@@ -8,6 +8,7 @@ import crypto from "node:crypto";
 import forge from "node-forge";
 import { SignedXml } from "xml-crypto";
 import { XMLParser } from "fast-xml-parser";
+import { installSmsGateway } from "./sms-worker.js";
 
 const PORT = Number(process.env.PORT || 8787);
 const TOKEN = process.env.CONECTOR_TOKEN || "";
@@ -52,6 +53,8 @@ app.use((req, res, next) => {
   log("02", "Token validado");
   next();
 });
+
+installSmsGateway(app, { token: TOKEN });
 
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
@@ -952,7 +955,16 @@ const parser = new XMLParser({ ignoreAttributes: false, removeNSPrefix: true, pa
 
 function interpretarRetorno(xml) {
   const doc = parser.parse(xml || "");
-  const flat = JSON.stringify(doc);
+  // A Prefeitura devolve o RetornoXML como string dentro do envelope SOAP:
+  // desescapamos para que Sucesso/Descricao sejam encontrados no texto plano.
+  const flat = JSON.stringify(doc)
+    .replace(/\\"/g, '"')
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/<\s*Sucesso\s*>\s*true\s*<\s*\/\s*Sucesso\s*>/gi, '"Sucesso":true')
+    .replace(/<\s*NumeroNFe\s*>([^<]+)<\s*\/\s*NumeroNFe\s*>/gi, '"NumeroNFe":"$1"')
+    .replace(/<\s*CodigoVerificacao\s*>([^<]+)<\s*\/\s*CodigoVerificacao\s*>/gi, '"CodigoVerificacao":"$1"')
+    .replace(/<\s*Descricao\s*>([^<]+)<\s*\/\s*Descricao\s*>/gi, '"Descricao":"$1"');
   const retorno = doc?.Envelope?.Body ?? doc;
   const sucesso = /"Sucesso":"?true/i.test(flat);
   const numero = /"NumeroNFe":"?([^",}]+)/i.exec(flat)?.[1] || null;
@@ -1031,38 +1043,53 @@ app.post("/nfse/emitir", async (req, res) => {
     });
 
     etapa = "08";
-    const info = interpretarRetorno(r.body);
-    if (r.status !== 200 || !info.sucesso) {
-      logErro("08", "Prefeitura retornou erro", {
-        ...contexto,
-        http_status: r.status,
-        content_type: r.contentType,
-        bytes: r.body.length,
-        mensagem: info.erro || null,
-        trecho: sanitiza(r.body, 600),
-      });
-      return res.status(422).json({
-        etapa: "08 - resposta da Prefeitura",
-        erro: info.erro || `HTTP ${r.status}`,
-        http_status: r.status,
-        content_type: r.contentType,
-        endpoint: r.endpoint,
-        ambiente,
-        rps_numero: contexto.rps_numero,
-        rps_serie: contexto.rps_serie,
-        resposta_trecho: sanitiza(r.body, 2000),
-        xml_retorno: r.body.slice(0, 4000),
+    // O veredito vem exclusivamente do XML municipal — HTTP 200 nao aprova nada.
+    const info = interpretarEnvioRps(r.body, r.status);
+    const comum = {
+      ...info,
+      etapa: "08 - resposta da Prefeitura",
+      transmitido: true,
+      http_status: r.status,
+      content_type: r.contentType,
+      endpoint: r.endpoint,
+      ambiente,
+      rps_numero: info.numero_rps || contexto.rps_numero,
+      rps_serie: info.serie_rps || contexto.rps_serie,
+      xml_retorno: r.body.slice(0, 8000),
+    };
+
+    if (info.status_final === "EMITIDA") {
+      log("09", "NFS-e emitida", { ...contexto, numero_nfse: info.numero_nfse, codigo_verificacao: info.codigo_verificacao });
+      return res.json({
+        ...comum,
+        numero_nfse: info.numero_nfse,
+        codigo_verificacao: info.codigo_verificacao,
+        link: `https://nfe.prefeitura.sp.gov.br/contribuinte/notaprint.aspx?inscricao=${zeros(p.prestador.inscricao_municipal, 8)}&nf=${info.numero_nfse}&verificacao=${info.codigo_verificacao || ""}`,
       });
     }
-    log("09", "NFS-e emitida", { ...contexto, numero_nfse: info.numero });
-    res.json({
-      numero_nfse: info.numero,
-      codigo_verificacao: info.codigo,
-      link: info.numero
-        ? `https://nfe.prefeitura.sp.gov.br/contribuinte/notaprint.aspx?inscricao=${zeros(p.prestador.inscricao_municipal, 8)}&nf=${info.numero}&verificacao=${info.codigo || ""}`
-        : null,
-      xml_retorno: r.body.slice(0, 8000),
+
+    if (info.status_final === "REJEITADA") {
+      logErro("08", "Prefeitura rejeitou o RPS", {
+        ...contexto,
+        http_status: r.status,
+        codigo: info.codigo,
+        mensagem: info.mensagem,
+      });
+      return res.status(422).json({ ...comum, erro: info.mensagem || `Rejeitado (codigo ${info.codigo || "?"})` });
+    }
+
+    // Nao classificar como falha reenviavel: RPS pode ter sido consumido.
+    logErro("08", "Resultado indeterminado — NAO REENVIAR", {
+      ...contexto,
+      http_status: r.status,
+      trecho: sanitiza(r.body, 600),
     });
+    return res.status(409).json({
+      ...comum,
+      erro: "RESULTADO INDETERMINADO — NÃO REENVIAR. Consulte a situação do RPS/NFS-e na Prefeitura.",
+      resposta_trecho: sanitiza(r.body, 2000),
+    });
+
   } catch (e) {
     const nomeEtapa =
       { "03": "leitura/abertura do PFX", "05": "montagem do XML", "06": "assinatura do XML", "07": "conexao com a Prefeitura", "08": "interpretacao do retorno" }[etapa] ||
@@ -1156,6 +1183,7 @@ function auditarRespostaSoap(bruto) {
     mensagem: null,
     correcao: null,
     soap_fault: null,
+    municipal: null,
   };
 
   let doc;
@@ -1224,6 +1252,7 @@ function auditarRespostaSoap(bruto) {
     const raizKey = Object.keys(result).find((k) => !k.startsWith("@_"));
     out.raiz_municipal = raizKey ? nomeLocal(raizKey) : null;
     out.xml_municipal_encontrado = raizKey ? "SIM" : "NAO";
+    out.municipal = result;
     coletarOcorrencias(result, "Erro", out.ocorrencias);
     coletarOcorrencias(result, "Alerta", out.ocorrencias);
     const flat = JSON.stringify(result);
@@ -1255,6 +1284,7 @@ function auditarRespostaSoap(bruto) {
     return finalizarAuditoria(out);
   }
   out.xml_municipal_encontrado = "SIM";
+  out.municipal = municipal;
   out.raiz_municipal = Object.keys(municipal || {}).find((k) => !k.startsWith("?")) || null;
   coletarOcorrencias(municipal, "Erro", out.ocorrencias);
   coletarOcorrencias(municipal, "Alerta", out.ocorrencias);
@@ -1271,6 +1301,61 @@ function finalizarAuditoria(out) {
     out.mensagem = principal.mensagem || out.mensagem;
     out.correcao = principal.correcao;
   }
+  return out;
+}
+
+/**
+ * Parser oficial da resposta de EnvioRPS.
+ * Reutiliza a auditoria robusta do TesteEnvioLoteRPS: localiza soap:Body por
+ * local-name, o *Response, o RetornoXML (escapado/CDATA/string/XML interno) e
+ * parseia o XML municipal. HTTP 200 NUNCA e veredito: quem decide e o XML.
+ */
+function buscarValor(no, nome) {
+  if (!no || typeof no !== "object") return null;
+  for (const [k, v] of Object.entries(no)) {
+    if (nomeLocal(k) === nome) {
+      const item = Array.isArray(v) ? v[0] : v;
+      if (item != null && typeof item !== "object") return String(item);
+      if (item && typeof item === "object" && item["#text"] != null) return String(item["#text"]);
+    }
+    const lista = Array.isArray(v) ? v : [v];
+    for (const item of lista) {
+      const achado = buscarValor(item, nome);
+      if (achado != null) return achado;
+    }
+  }
+  return null;
+}
+
+function interpretarEnvioRps(bruto, httpStatus) {
+  const a = auditarRespostaSoap(bruto);
+  const m = a.municipal;
+  const out = {
+    http_prefeitura: httpStatus,
+    soap_response: a.soap_response_encontrado,
+    elemento_response: a.elemento_response,
+    retorno_xml: a.result_encontrado,
+    elemento_result: a.elemento_result,
+    formato_result: a.formato_result,
+    xml_municipal: a.xml_municipal_encontrado,
+    raiz_municipal: a.raiz_municipal,
+    sucesso_prefeitura: a.sucesso,
+    numero_nfse: m ? buscarValor(m, "NumeroNFe") : null,
+    codigo_verificacao: m ? buscarValor(m, "CodigoVerificacao") : null,
+    chave_nfe: m ? buscarValor(m, "ChaveNotaNacional") : null,
+    data_emissao_nfse: m ? buscarValor(m, "DataEmissaoNFe") || buscarValor(m, "DataEmissao") : null,
+    numero_rps: m ? buscarValor(m, "NumeroRPS") : null,
+    serie_rps: m ? buscarValor(m, "SerieRPS") : null,
+    codigo: a.codigo,
+    mensagem: a.mensagem,
+    correcao: a.correcao,
+    ocorrencias: a.ocorrencias,
+    soap_fault: a.soap_fault,
+  };
+  const temErro = (a.ocorrencias || []).some((o) => o.tipo === "Erro");
+  if (a.sucesso === "SIM" && out.numero_nfse) out.status_final = "EMITIDA";
+  else if (a.sucesso === "NAO" && temErro) out.status_final = "REJEITADA";
+  else out.status_final = "INDETERMINADA";
   return out;
 }
 
