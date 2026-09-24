@@ -112,44 +112,34 @@ Deve retornar `{ "ok": true }`. Se não retornar, revise a configuração do Ren
 
 ## Human SMS Gateway
 
-O mesmo serviço também executa o gateway próprio de SMS do Cockpit Comercial.
+O mesmo serviço executa o gateway próprio de SMS do Cockpit Comercial.
 
-### Modo de validação
+### Operação
 
-Sem nenhuma credencial SMPP configurada, o gateway inicia em modo simulador:
+A rota de telecomunicação é configurada em:
 
-\`\`\`
-SMS_TRANSPORT=simulator
-\`\`\`
+\`Cockpit Comercial > SMS > Configurações\`
 
-Nesse modo nenhuma mensagem chega a uma operadora. A fila, os recibos de entrega, o
-opt-out e o histórico são testados de ponta a ponta sem custo.
+Existem dois modos:
 
-### Produção via SMPP
+- **Simulador**: valida fila, DLR, opt-out e relatórios sem enviar SMS real.
+- **SMPP**: usa a rota A2P contratada para produção.
 
-Para ativar SMS real, configure somente no ambiente seguro do Render (nunca no
-GitHub):
+As credenciais SMPP ficam criptografadas no banco do Human Clinic BI e são
+descriptografadas apenas no backend. Em cada teste/envio, o BI transmite a
+configuração ao conector por HTTPS e ela permanece somente em memória. Portanto,
+**não cadastrar host, usuário ou senha SMPP no GitHub ou no Render**.
 
-\`\`\`
-SMS_TRANSPORT=smpp
-SMPP_HOST=
-SMPP_PORT=2775
-SMPP_SYSTEM_ID=
-SMPP_PASSWORD=
-SMPP_SYSTEM_TYPE=
-SMPP_SOURCE_ADDR=HUMANCLINIC
-SMPP_TLS=false
-SMS_TPS=10
-SMS_MAX_SEGMENTS=10
-\`\`\`
+O Render precisa manter somente o \`CONECTOR_TOKEN\`, utilizado para autenticação
+entre o BI e o conector.
 
-O gateway usa a mesma autenticação segura do conector Human para conversar com o BI.
-O endereço do BI tem fallback para a aplicação Human Clinic publicada e pode ser
-sobrescrito por \`BI_BASE_URL\`.
+### Segurança operacional
 
-### Segurança
-
-- Nunca grave tokens, senhas SMPP ou certificados no repositório.
-- Sender ID e rota SMPP devem ser homologados para tráfego A2P no Brasil.
-- Falhas indeterminadas não são reenviadas automaticamente, evitando duplicidade.
-- Respostas de opt-out e links individuais alimentam a lista de bloqueio do BI.
+- Nunca grave tokens, senhas SMPP, certificados ou chaves no repositório.
+- O Sender ID/número precisa ser homologado para a rota A2P utilizada.
+- Mensagens longas são rastreadas por segmento.
+- Falhas indeterminadas não são reenviadas automaticamente.
+- Opt-out por resposta e por link individual alimenta a lista de bloqueio.
+- Após restart, o gateway inicia em modo \`idle\` e só processa mensagens depois
+  que o Cockpit injeta uma configuração válida. Isso evita entrega simulada
+  acidental em produção.
