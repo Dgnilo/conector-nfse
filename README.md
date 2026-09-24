@@ -108,3 +108,48 @@ curl https://conector-nfse.onrender.com/health
 ```
 
 Deve retornar `{ "ok": true }`. Se não retornar, revise a configuração do Render.
+
+
+## Human SMS Gateway
+
+O mesmo serviço também executa o gateway próprio de SMS do Cockpit Comercial.
+
+### Modo de validação
+
+Sem nenhuma credencial SMPP configurada, o gateway inicia em modo simulador:
+
+\`\`\`
+SMS_TRANSPORT=simulator
+\`\`\`
+
+Nesse modo nenhuma mensagem chega a uma operadora. A fila, os recibos de entrega, o
+opt-out e o histórico são testados de ponta a ponta sem custo.
+
+### Produção via SMPP
+
+Para ativar SMS real, configure somente no ambiente seguro do Render (nunca no
+GitHub):
+
+\`\`\`
+SMS_TRANSPORT=smpp
+SMPP_HOST=
+SMPP_PORT=2775
+SMPP_SYSTEM_ID=
+SMPP_PASSWORD=
+SMPP_SYSTEM_TYPE=
+SMPP_SOURCE_ADDR=HUMANCLINIC
+SMPP_TLS=false
+SMS_TPS=10
+SMS_MAX_SEGMENTS=10
+\`\`\`
+
+O gateway usa a mesma autenticação segura do conector Human para conversar com o BI.
+O endereço do BI tem fallback para a aplicação Human Clinic publicada e pode ser
+sobrescrito por \`BI_BASE_URL\`.
+
+### Segurança
+
+- Nunca grave tokens, senhas SMPP ou certificados no repositório.
+- Sender ID e rota SMPP devem ser homologados para tráfego A2P no Brasil.
+- Falhas indeterminadas não são reenviadas automaticamente, evitando duplicidade.
+- Respostas de opt-out e links individuais alimentam a lista de bloqueio do BI.
