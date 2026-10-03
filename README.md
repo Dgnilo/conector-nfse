@@ -1,71 +1,38 @@
 # Conector próprio NFS-e São Paulo (sem custo por nota)
 
-Serviço Node.js que recebe as requisições do BI (Configurações fiscais → Emissor = "Conector próprio")
-e fala com o web service da Prefeitura de São Paulo usando **TLS mútuo com o certificado A1** e
-**assinatura XML RSA-SHA1** — as duas coisas que o runtime do app não suporta.
+Serviço Node.js que recebe as requisições do BI (Configurações fiscais → Emissor = "Conector próprio") e fala com o web service da Prefeitura de São Paulo usando **TLS mútuo com o certificado A1** e **assinatura XML RSA-SHA1**.
 
 ## 1. Rodar localmente (teste)
 
 ```bash
 cd conector-nfse
 npm install
-CONECTOR_TOKEN="um-segredo-forte" npm start
+CONECTOR_TOKEN="gere-um-segredo-forte" npm start
 # -> http://localhost:8787
 ```
 
-## 2. Publicar de graça
+## 2. Publicar
 
-Qualquer host **Node.js** serve. O conector NÃO roda em Python — certifique-se de escolher runtime Node.
+Qualquer host **Node.js** serve.
 
-### Render.com (recomendado, gratuito)
+### Render.com
 
-1. Crie um repositório no GitHub com o conteúdo desta pasta (`conector-nfse`).
-2. Acesse https://dashboard.render.com/ → **New +** → **Web Service**.
-3. Conecte o repositório `Dgnilo/conector-nfse` (ou o seu).
-4. Preencha EXATAMENTE assim:
+1. Crie/conecte o repositório GitHub do conector.
+2. Crie um **Web Service** com runtime Node.
+3. Use `npm install` como build e `npm start` como start.
+4. Em **Environment Variables**, cadastre `CONECTOR_TOKEN` com um segredo forte gerado fora do repositório.
+5. Nunca grave o valor real de `CONECTOR_TOKEN`, certificados, senhas ou chaves no GitHub.
 
-   | Campo | Valor |
-   |---|---|
-   | **Name** | `conector-nfse` |
-   | **Runtime** | `Node` ⚠️ (Render às vezes sugere Python — mude para Node) |
-   | **Root Directory** | deixe em branco (repo só tem essa pasta) |
-   | **Build Command** | `npm install` |
-   | **Start Command** | `npm start` |
-   | **Plan** | Free |
-
-5. Em **Environment Variables** adicione:
-
-   | Key | Value |
-   |---|---|
-   | `CONECTOR_TOKEN` | `w2wpfSt4JpS530sbcRass_z1mE7KVv1tVgFHavbO-aY` |
-
-6. Clique em **Create Web Service**.
-
-> Dica: inclua o arquivo `render.yaml` desta pasta no repo. Ele pré-configura o serviço como Node automaticamente.
-
-### Outras opções
-
-- **Fly.io** (free allowance): `fly launch` dentro de `conector-nfse`.
-- **Railway / Koyeb / Oracle Cloud Free VM**: mesmo comando `npm start`.
-- **Máquina própria/VPS da clínica**: `npm start` + proxy HTTPS (Caddy/Nginx).
-
-Variável de ambiente obrigatória:
-
-| Variável | Descrição |
-|---|---|
-| `CONECTOR_TOKEN` | Segredo compartilhado. O mesmo valor vai no campo **Token** da tela de Configurações fiscais. |
-| `PORT` | Opcional (default 8787). |
-
-O certificado **não** fica no conector: o BI envia o .pfx cifrado no corpo da requisição a cada emissão.
+O certificado **não** fica no conector: o BI envia o PFX cifrado no corpo da requisição quando necessário.
 
 ## 3. Ligar no BI
 
 Em **/ebrain/nfse-config**:
 
 - Emissor: `Conector próprio`
-- URL: `https://seu-conector.onrender.com`
-- Token: o mesmo `CONECTOR_TOKEN`
-- Ambiente: `homologacao` para testar, depois `producao`
+- URL: URL HTTPS do serviço publicado
+- Token: o mesmo `CONECTOR_TOKEN` configurado como segredo no host
+- Ambiente: conforme a operação fiscal configurada
 
 ## 4. Endpoints
 
@@ -74,41 +41,20 @@ Em **/ebrain/nfse-config**:
 - `POST /nfse/consultar` → consulta por número de RPS
 - `POST /nfse/cancelar` → cancela NFS-e
 
-Todos exigem `Authorization: Bearer <CONECTOR_TOKEN>`.
+Todos os endpoints protegidos exigem `Authorization: Bearer <CONECTOR_TOKEN>`.
 
-## 5. Homologação
+## 5. Segurança operacional
 
-A Prefeitura exige teste em homologação antes de liberar produção
-(`https://nfeh.prefeitura.sp.gov.br/ws/lotenfe.asmx`). Use ambiente `homologacao`
-na tela de configuração até validar o primeiro RPS.
+- Nunca grave tokens, senhas, certificados, PFX ou chaves privadas no repositório.
+- Se qualquer segredo tiver sido publicado em Git ou documentação, trate-o como comprometido e **rotacione-o no provedor e no BI**.
+- O conector deve receber credenciais somente por variáveis de ambiente ou pelo cofre criptografado do BI.
+- Falhas indeterminadas de transmissão fiscal não devem ser reenviadas automaticamente.
 
-## 6. Problemas comuns
+## 6. Diagnóstico
 
-### O deploy no Render fica com status "Python 3"
+`GET /health` deve responder `{ "ok": true }`.
 
-O Render às vezes detecta linguagem errada. Vá em **Settings** do serviço e altere:
-
-- **Runtime**: `Node`
-- **Build Command**: `npm install`
-- **Start Command**: `npm start`
-
-Depois clique em **Manual Deploy → Deploy latest commit**.
-
-### `curl /health` não responde / timeout
-
-Provavelmente o runtime está como Python ou falta `CONECTOR_TOKEN`. Verifique os logs em
-**Logs** no dashboard do Render.
-
-### A nota fica "enviando" no BI
-
-Isso acontece quando o conector está fora do ar ou a URL está incorreta. Teste:
-
-```bash
-curl https://conector-nfse.onrender.com/health
-```
-
-Deve retornar `{ "ok": true }`. Se não retornar, revise a configuração do Render.
-
+O serviço também possui rotas autenticadas de diagnóstico que não emitem NFS-e; use-as antes de qualquer teste fiscal real.
 
 ## Human SMS Gateway
 
@@ -116,30 +62,17 @@ O mesmo serviço executa o gateway próprio de SMS do Cockpit Comercial.
 
 ### Operação
 
-A rota de telecomunicação é configurada em:
-
-\`Cockpit Comercial > SMS > Configurações\`
+A rota de telecomunicação é configurada em `Cockpit Comercial > SMS > Configurações`.
 
 Existem dois modos:
 
 - **Simulador**: valida fila, DLR, opt-out e relatórios sem enviar SMS real.
 - **SMPP**: usa a rota A2P contratada para produção.
 
-As credenciais SMPP ficam criptografadas no banco do Human Clinic BI e são
-descriptografadas apenas no backend. Em cada teste/envio, o BI transmite a
-configuração ao conector por HTTPS e ela permanece somente em memória. Portanto,
-**não cadastrar host, usuário ou senha SMPP no GitHub ou no Render**.
+As credenciais SMPP ficam criptografadas no banco do Human Clinic BI e são descriptografadas apenas no backend. Em cada teste/envio, o BI transmite a configuração ao conector por HTTPS e ela permanece somente em memória. Portanto, **não cadastrar host, usuário ou senha SMPP no GitHub ou no Render**.
 
-O Render precisa manter somente o \`CONECTOR_TOKEN\`, utilizado para autenticação
-entre o BI e o conector.
-
-### Segurança operacional
-
-- Nunca grave tokens, senhas SMPP, certificados ou chaves no repositório.
 - O Sender ID/número precisa ser homologado para a rota A2P utilizada.
 - Mensagens longas são rastreadas por segmento.
 - Falhas indeterminadas não são reenviadas automaticamente.
 - Opt-out por resposta e por link individual alimenta a lista de bloqueio.
-- Após restart, o gateway inicia em modo \`idle\` e só processa mensagens depois
-  que o Cockpit injeta uma configuração válida. Isso evita entrega simulada
-  acidental em produção.
+- Após restart, o gateway inicia em modo `idle` e só processa mensagens depois que o Cockpit injeta uma configuração válida.
