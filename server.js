@@ -1123,7 +1123,7 @@ const logT = (etapa, msg, extra) =>
   console.log(`[TESTE-NFSE-SP] ${etapa} - ${msg}${extra ? " " + JSON.stringify(extra) : ""} @ ${ts()}`);
 
 // Parser sem remocao de prefixo: precisamos inspecionar o Body por local-name().
-const parserBruto = new XMLParser({ ignoreAttributes: false, parseTagValue: false, processEntities: true });
+const parserBruto = new XMLParser({ ignoreAttributes: false, parseTagValue: false, processEntities: false });
 
 const nomeLocal = (k) => String(k).replace(/^.*:/, "");
 
