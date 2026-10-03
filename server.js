@@ -1671,8 +1671,18 @@ app.post("/nfse/cancelar", async (req, res) => {
 // ─────────────────────── NFS-e recebidas (tomador) ───────────────────────
 // Consulta oficial, somente leitura. Não emite, cancela nem altera NFS-e.
 // ConsultaNFeRecebidas usa PedidoConsultaNFePeriodo e paginação municipal.
+function cpfCnpjXml(doc) {
+  const d = digitos(doc);
+  if (d.length === 11) return `<CPF>${d}</CPF>`;
+  if (d.length === 14) return `<CNPJ>${d}</CNPJ>`;
+  throw new Error("CPF/CNPJ da consulta de NFS-e recebidas inválido.");
+}
+
 function xmlConsultaNFeRecebidas(p) {
-  const cnpj = zeros(p.tomador?.cnpj || p.prestador?.cnpj, 14);
+  const tomadorDoc = digitos(p.tomador?.cpf || p.tomador?.cnpj || p.tomador?.cpf_cnpj);
+  const remetenteDoc = digitos(
+    p.remetente?.cpf || p.remetente?.cnpj || p.remetente?.cpf_cnpj || tomadorDoc,
+  );
   const ccm = digitos(p.tomador?.inscricao_municipal || p.prestador?.inscricao_municipal);
   const inicio = so(p.data_inicio).slice(0, 10);
   const fim = so(p.data_fim).slice(0, 10);
@@ -1683,8 +1693,8 @@ function xmlConsultaNFeRecebidas(p) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <PedidoConsultaNFePeriodo xmlns="http://www.prefeitura.sp.gov.br/nfe">
 <Cabecalho xmlns="" Versao="1">
-<CPFCNPJRemetente><CNPJ>${cnpj}</CNPJ></CPFCNPJRemetente>
-<CPFCNPJ><CNPJ>${cnpj}</CNPJ></CPFCNPJ>
+<CPFCNPJRemetente>${cpfCnpjXml(remetenteDoc)}</CPFCNPJRemetente>
+<CPFCNPJ>${cpfCnpjXml(tomadorDoc)}</CPFCNPJ>
 ${ccm ? `<Inscricao>${zeros(ccm, 8)}</Inscricao>` : ""}
 <dtInicio>${inicio}</dtInicio>
 <dtFim>${fim}</dtFim>
