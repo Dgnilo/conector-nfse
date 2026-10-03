@@ -1,0 +1,34 @@
+name: Apply NFS-e Recebidas Multi Entidade
+
+on:
+  push:
+    paths:
+      - '.github/workflows/apply-recebidas-multi-entidade.yml'
+      - 'scripts/patch-recebidas-multi-entidade.py'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Aplicar patch
+        run: python3 scripts/patch-recebidas-multi-entidade.py
+      - name: Validar sintaxe
+        run: node --check server.js
+      - name: Commit e push
+        run: |
+          if git diff --quiet -- server.js; then
+            echo 'Nenhuma alteração necessária.'
+            exit 0
+          fi
+          git config user.name 'ChatGPT Finance'
+          git config user.email 'actions@users.noreply.github.com'
+          git add server.js
+          git commit -m 'feat(nfse): suportar CPF e múltiplos tomadores na consulta recebidas'
+          git push
