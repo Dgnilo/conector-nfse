@@ -1,0 +1,168 @@
+name: Add NFS-e Recebidas
+
+on:
+  push:
+    paths:
+      - '.github/workflows/add-nfse-recebidas.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Instalar dependencias
+        run: npm ci
+      - name: Adicionar rota ConsultaNFeRecebidas
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('server.js')
+          s=p.read_text()
+          marker='app.listen(PORT, () => console.log(`Conector NFS-e SP rodando na porta ${PORT}`));'
+          if 'app.post("/nfse/recebidas"' in s:
+              print('Rota já existe; nada a alterar.')
+              raise SystemExit(0)
+          if marker not in s:
+              raise SystemExit('Marcador app.listen não encontrado')
+          block=r'''
+
+// ─────────────────────── NFS-e recebidas (tomador) ───────────────────────
+// Consulta oficial, somente leitura. Não emite, cancela nem altera NFS-e.
+// O método ConsultaNFeRecebidas usa PedidoConsultaNFePeriodo.xsd e retorna
+// até 50 notas por página, conforme manual da Prefeitura de São Paulo.
+function xmlConsultaNFeRecebidas(p) {
+  const cnpj = zeros(p.tomador?.cnpj || p.prestador?.cnpj, 14);
+  const ccm = digitos(p.tomador?.inscricao_municipal || p.prestador?.inscricao_municipal);
+  const inicio = so(p.data_inicio).slice(0, 10);
+  const fim = so(p.data_fim).slice(0, 10);
+  const pagina = Math.max(1, Number(p.pagina || 1));
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(inicio) || !/^\d{4}-\d{2}-\d{2}$/.test(fim)) {
+    throw new Error('data_inicio e data_fim devem estar no formato AAAA-MM-DD.');
+  }
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<PedidoConsultaNFePeriodo xmlns="http://www.prefeitura.sp.gov.br/nfe">
+<Cabecalho xmlns="" Versao="1">
+<CPFCNPJRemetente><CNPJ>${cnpj}</CNPJ></CPFCNPJRemetente>
+<CPFCNPJ><CNPJ>${cnpj}</CNPJ></CPFCNPJ>
+${ccm ? `<Inscricao>${zeros(ccm, 8)}</Inscricao>` : ''}
+<dtInicio>${inicio}</dtInicio>
+<dtFim>${fim}</dtFim>
+<NumeroPagina>${pagina}</NumeroPagina>
+</Cabecalho>
+</PedidoConsultaNFePeriodo>`;
+}
+
+function objetosPorNome(no, nome, out = []) {
+  if (!no || typeof no !== 'object') return out;
+  for (const [k, v] of Object.entries(no)) {
+    const itens = Array.isArray(v) ? v : [v];
+    if (nomeLocal(k) === nome) out.push(...itens.filter((x) => x && typeof x === 'object'));
+    for (const item of itens) if (item && typeof item === 'object') objetosPorNome(item, nome, out);
+  }
+  return out;
+}
+
+function objetoPorNome(no, nome) {
+  return objetosPorNome(no, nome, [])[0] || null;
+}
+
+function docCpfCnpj(no) {
+  if (!no) return null;
+  return buscarValor(no, 'CNPJ') || buscarValor(no, 'CPF') || null;
+}
+
+function nfeRecebidaDto(nfe) {
+  const chave = objetoPorNome(nfe, 'ChaveNFe');
+  const prestador = objetoPorNome(nfe, 'CPFCNPJPrestador');
+  const tomador = objetoPorNome(nfe, 'CPFCNPJTomador');
+  const issRetidoRaw = buscarValor(nfe, 'ISSRetido');
+  return {
+    numero: buscarValor(chave, 'Numero') || buscarValor(nfe, 'NumeroNFe') || null,
+    codigo_verificacao: buscarValor(chave, 'CodigoVerificacao') || buscarValor(nfe, 'CodigoVerificacao') || null,
+    inscricao_prestador: buscarValor(chave, 'InscricaoPrestador') || null,
+    data_emissao: buscarValor(nfe, 'DataEmissaoNFe') || null,
+    data_cancelamento: buscarValor(nfe, 'DataCancelamento') || null,
+    status: buscarValor(nfe, 'StatusNFe') || null,
+    prestador_cpf_cnpj: docCpfCnpj(prestador),
+    prestador_nome: buscarValor(nfe, 'RazaoSocialPrestador') || null,
+    tomador_cpf_cnpj: docCpfCnpj(tomador),
+    tomador_nome: buscarValor(nfe, 'RazaoSocialTomador') || null,
+    valor_servicos: Number(buscarValor(nfe, 'ValorServicos') || 0),
+    valor_deducoes: Number(buscarValor(nfe, 'ValorDeducoes') || 0),
+    valor_pis: Number(buscarValor(nfe, 'ValorPIS') || 0),
+    valor_cofins: Number(buscarValor(nfe, 'ValorCOFINS') || 0),
+    valor_inss: Number(buscarValor(nfe, 'ValorINSS') || 0),
+    valor_ir: Number(buscarValor(nfe, 'ValorIR') || 0),
+    valor_csll: Number(buscarValor(nfe, 'ValorCSLL') || 0),
+    valor_iss: Number(buscarValor(nfe, 'ValorISS') || 0),
+    iss_retido: /^(true|1|sim)$/i.test(String(issRetidoRaw || '')),
+    codigo_servico: buscarValor(nfe, 'CodigoServicos') || buscarValor(nfe, 'CodigoServico') || null,
+    discriminacao: buscarValor(nfe, 'Discriminacao') || null,
+  };
+}
+
+function interpretarConsultaNFeRecebidas(bruto) {
+  const a = auditarRespostaSoap(bruto);
+  const municipal = a.municipal;
+  const notas = municipal ? objetosPorNome(municipal, 'NFe', []).map(nfeRecebidaDto) : [];
+  return {
+    sucesso: a.sucesso === 'SIM',
+    codigo: a.codigo,
+    mensagem: a.mensagem,
+    ocorrencias: a.ocorrencias,
+    notas,
+  };
+}
+
+app.post("/nfse/recebidas", async (req, res) => {
+  try {
+    const p = req.body || {};
+    if (!p.certificado?.pfx_base64 || !p.certificado?.senha) {
+      return res.status(422).json({ erro: 'Certificado A1 não informado.' });
+    }
+    const { keyPem, certPem, pfxBuffer } = lerCertificado(p.certificado.pfx_base64, p.certificado.senha);
+    const pedido = xmlConsultaNFeRecebidas(p);
+    const xml = assinarXml(pedido, keyPem, certPem);
+    const dsig = verificarXmlDSigLocal(xml, certPem);
+    if (!dsig.ok) return res.status(422).json({ erro: `Falha na assinatura XML local: ${dsig.detalhe}` });
+
+    const r = await chamarPrefeitura({
+      ambiente: p.ambiente,
+      operacao: 'ConsultaNFeRecebidas',
+      xmlPedido: xml,
+      pfxBuffer,
+      senha: p.certificado.senha,
+    });
+    const info = interpretarConsultaNFeRecebidas(r.body);
+    if (r.status >= 400) return res.status(502).json({ erro: `Prefeitura respondeu HTTP ${r.status}`, ...info });
+    return res.json({
+      ...info,
+      pagina: Math.max(1, Number(p.pagina || 1)),
+      quantidade: info.notas.length,
+      tem_proxima_pagina: info.notas.length >= 50,
+    });
+  } catch (e) {
+    logErro('REC', 'Falha na consulta de NFS-e recebidas', { erro: e?.message || String(e) });
+    return res.status(500).json({ erro: e?.message || String(e) });
+  }
+});
+
+'''
+          p.write_text(s.replace(marker, block + marker))
+          PY
+      - name: Validar sintaxe
+        run: node --check server.js
+      - name: Commit
+        run: |
+          if git diff --quiet; then exit 0; fi
+          git config user.name "ChatGPT Finance"
+          git config user.email "actions@users.noreply.github.com"
+          git add server.js
+          git commit -m "feat(nfse): consultar notas recebidas da prefeitura"
+          git push
