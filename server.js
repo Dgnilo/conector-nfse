@@ -6,6 +6,7 @@ import tls from "node:tls";
 import dns from "node:dns/promises";
 import crypto from "node:crypto";
 import forge from "node-forge";
+import zlib from "node:zlib";
 import { SignedXml } from "xml-crypto";
 import { XMLParser } from "fast-xml-parser";
 import { installSmsGateway } from "./sms-worker.js";
@@ -975,6 +976,148 @@ function interpretarRetorno(xml) {
     null;
   return { sucesso, numero, codigo, erro, retorno };
 }
+
+// ───────────────────── NF-e / DF-e Ambiente Nacional ─────────────────────
+
+const DFE_ENDPOINTS = {
+  producao: "https://www1.nfe.fazenda.gov.br/NFeDistribuicaoDFe/NFeDistribuicaoDFe.asmx",
+  homologacao: "https://hom1.nfe.fazenda.gov.br/NFeDistribuicaoDFe/NFeDistribuicaoDFe.asmx",
+};
+
+const UF_CODIGO = {
+  AC:"12",AL:"27",AP:"16",AM:"13",BA:"29",CE:"23",DF:"53",ES:"32",GO:"52",MA:"21",MT:"51",MS:"50",
+  MG:"31",PA:"15",PB:"25",PR:"41",PE:"26",PI:"22",RJ:"33",RN:"24",RS:"43",RO:"11",RR:"14",SC:"42",
+  SP:"35",SE:"28",TO:"17",
+};
+
+function textoNode(v) {
+  if (v == null) return "";
+  if (typeof v === "object") return String(v["#text"] ?? v._ ?? "");
+  return String(v);
+}
+function numNode(v) {
+  const n=Number(String(textoNode(v)).replace(",","."));
+  return Number.isFinite(n)?n:0;
+}
+function encontrarChave(obj, chave) {
+  if (!obj || typeof obj!=="object") return null;
+  if (Object.prototype.hasOwnProperty.call(obj,chave)) return obj[chave];
+  for (const v of Object.values(obj)) {
+    if (v && typeof v==="object") {
+      const achou=encontrarChave(v,chave);
+      if (achou!=null) return achou;
+    }
+  }
+  return null;
+}
+function xmlDistribuicaoDfe({ ambiente, cnpj, uf, ultNsu }) {
+  const tpAmb=ambiente==="homologacao"?"2":"1";
+  const cUFAutor=UF_CODIGO[String(uf||"SP").toUpperCase()]||"35";
+  const nsu=String(ultNsu||"0").replace(/\D/g,"").slice(-15).padStart(15,"0");
+  return `<?xml version="1.0" encoding="utf-8"?>
+<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
+<soap12:Body>
+<nfeDistDFeInteresse xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
+<nfeDadosMsg>
+<distDFeInt versao="1.01" xmlns="http://www.portalfiscal.inf.br/nfe">
+<tpAmb>${tpAmb}</tpAmb><cUFAutor>${cUFAutor}</cUFAutor><CNPJ>${digitos(cnpj)}</CNPJ>
+<distNSU><ultNSU>${nsu}</ultNSU></distNSU>
+</distDFeInt>
+</nfeDadosMsg>
+</nfeDistDFeInteresse>
+</soap12:Body>
+</soap12:Envelope>`;
+}
+function postDfe({ endpoint, xml, pfxBuffer, senha }) {
+  const url=new URL(endpoint);
+  const body=Buffer.from(xml,"utf8");
+  return new Promise((resolve,reject)=>{
+    const req=https.request({
+      method:"POST",host:url.hostname,servername:url.hostname,path:url.pathname,port:443,
+      pfx:pfxBuffer,passphrase:senha,minVersion:"TLSv1.2",rejectUnauthorized:true,
+      headers:{
+        "Content-Type":'application/soap+xml; charset=utf-8; action="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse"',
+        "Content-Length":body.length,
+        Accept:"application/soap+xml, text/xml, */*",
+        "User-Agent":"HumanClinicBI-ConectorDFe/1.0",
+        Connection:"close",
+      },
+    },resp=>{
+      const chunks=[];
+      resp.on("data",x=>chunks.push(x));
+      resp.on("end",()=>resolve({status:resp.statusCode||0,body:Buffer.concat(chunks).toString("utf8")}));
+    });
+    req.setTimeout(90000,()=>req.destroy(new Error("timeout na consulta NFeDistribuicaoDFe")));
+    req.on("error",reject);
+    req.write(body);req.end();
+  });
+}
+function parseDfeXml(xml) {
+  const doc=parser.parse(xml||"");
+  const ret=encontrarChave(doc,"retDistDFeInt")||{};
+  const cStat=textoNode(ret.cStat);
+  const xMotivo=textoNode(ret.xMotivo);
+  const ultNSU=textoNode(ret.ultNSU)||"0";
+  const maxNSU=textoNode(ret.maxNSU)||ultNSU;
+  const lote=ret.loteDistDFeInt||{};
+  let zips=lote.docZip||[];
+  if(!Array.isArray(zips)) zips=zips?[zips]:[];
+  const documentos=[];
+  for(const z of zips){
+    try{
+      const schema=String(z?.["@_schema"]||z?.schema||"");
+      const nsu=String(z?.["@_NSU"]||z?.NSU||"");
+      const b64=textoNode(z);
+      if(!b64) continue;
+      const inner=zlib.gunzipSync(Buffer.from(b64,"base64")).toString("utf8");
+      const x=parser.parse(inner);
+      const proc=encontrarChave(x,"nfeProc");
+      const nfe=proc?.NFe||encontrarChave(x,"NFe");
+      const inf=nfe?.infNFe||null;
+      const res=encontrarChave(x,"resNFe");
+      if(inf){
+        const ide=inf.ide||{},emit=inf.emit||{},dest=inf.dest||{},total=inf.total?.ICMSTot||{};
+        const chave=String(inf?.["@_Id"]||"").replace(/^NFe/,"");
+        documentos.push({
+          nsu,schema,tipo:"nfe",chave_acesso:chave,
+          numero:textoNode(ide.nNF),serie:textoNode(ide.serie),
+          data_emissao:textoNode(ide.dhEmi||ide.dEmi).slice(0,10)||null,
+          emitente_cnpj:digitos(textoNode(emit.CNPJ||emit.CPF)),emitente_nome:textoNode(emit.xNome),
+          destinatario_cnpj:digitos(textoNode(dest.CNPJ||dest.CPF)),valor_nf:numNode(total.vNF),
+          xml:inner,resumo:false,
+        });
+      } else if(res){
+        documentos.push({
+          nsu,schema,tipo:"nfe",chave_acesso:textoNode(res.chNFe),
+          numero:null,serie:null,data_emissao:textoNode(res.dhEmi).slice(0,10)||null,
+          emitente_cnpj:digitos(textoNode(res.CNPJ||res.CPF)),emitente_nome:textoNode(res.xNome),
+          destinatario_cnpj:null,valor_nf:numNode(res.vNF),xml:inner,resumo:true,
+        });
+      }
+    }catch(e){
+      documentos.push({erro:e?.message||String(e),schema:String(z?.["@_schema"]||""),nsu:String(z?.["@_NSU"]||"")});
+    }
+  }
+  return {cStat,xMotivo,ultNSU,maxNSU,documentos};
+}
+
+app.post("/dfe/distribuicao", async (req,res)=>{
+  try{
+    const p=req.body||{};
+    const cnpj=digitos(p.cnpj);
+    if(cnpj.length!==14) return res.status(422).json({sucesso:false,erro:"CNPJ destinatário inválido."});
+    const ambiente=p.ambiente==="homologacao"?"homologacao":"producao";
+    const {pfxBuffer}=lerCertificado(p.certificado?.pfx_base64,p.certificado?.senha);
+    const xml=xmlDistribuicaoDfe({ambiente,cnpj,uf:p.uf||"SP",ultNsu:p.ult_nsu||"0"});
+    const r=await postDfe({endpoint:DFE_ENDPOINTS[ambiente],xml,pfxBuffer,senha:p.certificado?.senha});
+    if(r.status<200||r.status>=300) return res.status(502).json({sucesso:false,erro:`SEFAZ respondeu HTTP ${r.status}`});
+    const parsed=parseDfeXml(r.body);
+    const ok=["137","138","656"].includes(parsed.cStat);
+    return res.status(ok?200:422).json({sucesso:ok,...parsed});
+  }catch(e){
+    return res.status(502).json({sucesso:false,erro:e?.message||String(e)});
+  }
+});
 
 // ───────────────────────── rotas ─────────────────────────
 
