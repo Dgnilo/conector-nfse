@@ -1112,7 +1112,7 @@ app.post("/dfe/distribuicao", async (req,res)=>{
     const r=await postDfe({endpoint:DFE_ENDPOINTS[ambiente],xml,pfxBuffer,senha:p.certificado?.senha});
     if(r.status<200||r.status>=300) return res.status(502).json({sucesso:false,erro:`SEFAZ respondeu HTTP ${r.status}`});
     const parsed=parseDfeXml(r.body);
-    const ok=["137","138","656"].includes(parsed.cStat);
+    const ok=["137","138"].includes(parsed.cStat);
     return res.status(ok?200:422).json({sucesso:ok,...parsed});
   }catch(e){
     return res.status(502).json({sucesso:false,erro:e?.message||String(e)});
