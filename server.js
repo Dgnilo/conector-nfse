@@ -1,6 +1,7 @@
 // Conector proprio NFS-e Sao Paulo: mTLS + assinatura XML (RSA-SHA1).
 // Recebe chamadas autenticadas do BI e fala com o web service da Prefeitura.
 import express from "express";
+import { resumirConsultaNfse } from "./nfse-diagnostico.js";
 import https from "node:https";
 import tls from "node:tls";
 import dns from "node:dns/promises";
@@ -406,7 +407,8 @@ function assinarXml(xml, keyPem, certPem) {
     hash_sem_assinatura_sha256: crypto.createHash("sha256").update(semAssinatura, "utf8").digest("hex").slice(0, 16),
     uri_referencia_vazia: /URI=""/.test(assinado),
     id_na_raiz: /<PedidoEnvioRPS[^>]*\sId=/i.test(assinado),
-    assinatura_ultimo_filho: /<\/(\w+:)?Signature>\s*<\/PedidoEnvioRPS>/i.test(assinado),
+    // Consulta tem raiz PedidoConsultaNFe, diferente de PedidoEnvioRPS.
+    assinatura_ultimo_filho: /<\/(?:\w+:)?Signature>\s*<\/(?:\w+:)?[A-Za-z][\w.-]*>\s*$/i.test(assinado),
     bytes: assinado.length,
   });
   return assinado;
@@ -1778,7 +1780,10 @@ app.post("/nfse/consultar", async (req, res) => {
       pfxBuffer,
       senha: p.certificado.senha,
     });
-    res.json({ ...interpretarRetorno(r.body), xml_retorno: r.body.slice(0, 8000) });
+    const interpretado = interpretarRetorno(r.body);
+    // Apenas indicadores. Nao registrar XML, CPF, nome, RPS ou certificado.
+    log("09", "Resultado da consulta fiscal (sem dados pessoais)", resumirConsultaNfse(r.status, r.body, interpretado));
+    res.json({ ...interpretado, xml_retorno: r.body.slice(0, 8000) });
   } catch (e) {
     res.status(500).json({ erro: e?.message || String(e) });
   }
