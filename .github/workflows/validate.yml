@@ -1,6 +1,8 @@
 name: Validate Connector
 
 on:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
   workflow_dispatch:
@@ -22,6 +24,9 @@ jobs:
         run: |
           node --check server.js
           node --check sms-worker.js
+
+      - name: Validate safe NFS-e response classification
+        run: node --test nfse-diagnostico.test.js
 
       - name: Start simulator
         run: |
